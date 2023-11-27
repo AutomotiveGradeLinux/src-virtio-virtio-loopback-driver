@@ -260,10 +260,6 @@ typedef struct efd_data {
 	int pid;
 } efd_data_t;
 
-/*
- * ref: https://elixir.bootlin.com/linux/latest/source/arch/x86/mm/init_64.c#L1419
- */
-
 /* IOCTL defines */
 #define EFD_INIT _IOC(_IOC_WRITE, 'k', 1, sizeof(efd_data))
 #define WAKEUP _IOC(_IOC_WRITE, 'k', 2, 0)

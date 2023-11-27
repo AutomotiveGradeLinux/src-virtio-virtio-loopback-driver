@@ -64,7 +64,7 @@
 
 #include <linux/pagemap.h>
 
-#include <linux/kfifo.h>
+#include <linux/delay.h>
 
 /* Features */
 MODULE_LICENSE("GPL v2");
@@ -104,6 +104,15 @@ const struct vring *global_vring;
 static int interrupt_cnt;
 static int notify_sent, notify_received;
 
+/* Define a structure for your notify_list */
+struct notify_data {
+    uint32_t index;
+    struct list_head list;
+};
+static LIST_HEAD(notify_list);
+/* Define workqueues for notifications and interrupts */
+static struct workqueue_struct *notify_workqueue, *interrupt_workqueue;
+
 static struct platform_device virtio_loopback_device = {
 	.name = "loopback-transport",
 	.id = -1,
@@ -139,8 +148,6 @@ static struct loopback_device_data loopback_data[MAX_DEV];
 unsigned long loopback_flags;
 #define IN_USE_BIT 0
 
-#define KFIFO_SIZE 1024
-static struct kfifo notify_queue;
 int32_t notified_vq_index;
 int notify_flag;
 int cur_ram_idx;
@@ -315,28 +322,19 @@ static void vm_reset(struct virtio_device *vdev)
 	write_adapter(0, VIRTIO_MMIO_STATUS, 4);
 }
 
-static struct workqueue_struct *notify_workqueue, *interrupt_workqueue;
 static void async_work_handler(struct work_struct *work)
 {
-	int vq_index, ret;
-
-	mutex_lock(&notify_lock);
+	struct notify_data *entry, *tmp;
 
 	mutex_lock(&notify_q_lock);
-	ret = kfifo_get(&notify_queue, &vq_index);
-	if (ret == 0) {
-		DBG("fifo is empty\n");
-		DBG("kfifo_len -> %d\n", kfifo_len(&notify_queue));
-		mutex_unlock(&notify_q_lock);
-		mutex_unlock(&notify_lock);
-		return;
-	}
+    list_for_each_entry_safe(entry, tmp, &notify_list, list) {
+		pr_crit("notify_received: %d, VQ: %d\n", notify_received++, entry->index);
+		write_adapter(entry->index, VIRTIO_MMIO_QUEUE_NOTIFY, 4);
+        list_del(&entry->list);
+        kfree(entry);
+    }
 	mutex_unlock(&notify_q_lock);
 
-	DBG("notify_received: %d, VQ: %d\n", notify_received++, vq_index);
-	write_adapter(vq_index, VIRTIO_MMIO_QUEUE_NOTIFY, 4);
-
-	mutex_unlock(&notify_lock);
 }
 
 DECLARE_WORK(async_work, async_work_handler);
@@ -344,31 +342,26 @@ DECLARE_WORK(async_work, async_work_handler);
 /* the notify function used when creating a virt queue */
 static bool vm_notify(struct virtqueue *vq)
 {
-	int ret, prev_len, vq_index;
+	//uint32_t ret, prev_len, vq_index;
+	struct notify_data *data;
 	/*
 	 * We write the queue's selector into
 	 * the notification register to signal
 	 * the other end
 	 */
 	mutex_lock(&notify_q_lock);
+	pr_crit("vm_notify\n");
 
-	prev_len = kfifo_len(&notify_queue);
-	vq_index = vq->index;
+	data = kmalloc(sizeof(struct notify_data), GFP_KERNEL);
+	data->index = vq->index;
+	INIT_LIST_HEAD(&data->list);
+	list_add_tail(&data->list, &notify_list);
 
-	ret = kfifo_put(&notify_queue, vq_index);
-	if (ret == 0) {
-			if (prev_len == kfifo_len(&notify_queue)) {
-			DBG("fifo is full: len = %d\n", kfifo_len(&notify_queue));
-			DBG("kfifo_put failed with error: %d\n", ret);
-			mutex_unlock(&notify_q_lock);
-			return false;
-			}
-	}
-
-	DBG("ADD in kfifo: %d, VQ: %d\n", notify_sent++, vq_index);
 
 	/* This doesn't make any difference in or out of the block */
-	queue_work(notify_workqueue, &async_work);
+	if (!queue_work(notify_workqueue, &async_work)) {
+		pr_info("Fails to start work_queue, but no problem\n");
+	}
 	mutex_unlock(&notify_q_lock);
 
 	return true;
@@ -384,7 +377,7 @@ static void vm_interrupt(struct work_struct *work)
 
 	/* STATUS and ACK should ne done without any intermediate status change */
 	mutex_lock(&interrupt_lock);
-	DBG("interrupt_cnt: %d\n", interrupt_cnt++);
+	pr_crit("interrupt_cnt: %d\n", interrupt_cnt++);
 
 	/* Read and acknowledge interrupts */
 	status = read_adapter(VIRTIO_MMIO_INTERRUPT_STATUS, 4);
@@ -481,6 +474,8 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned int in
 		err = -ENOMEM;
 		goto error_new_virtqueue;
 	}
+
+	vq->num_max = num;
 
 	/* Activate the queue */
 	write_adapter(virtqueue_get_vring_size(vq), VIRTIO_MMIO_QUEUE_NUM, 4);
@@ -953,8 +948,7 @@ int pf_mmap_vm_page(struct file *filp, struct vm_area_struct *vma)
 	uint64_t size = (unsigned long)(vma->vm_end - vma->vm_start);
 	uint64_t pfn = ((cur_ram_idx++) * 0x40000);
 
-	vma->vm_flags |= VM_PFNMAP;
-
+	vm_flags_set(vma, VM_PFNMAP);
 	add_share_mmap(filp, pfn, vma->vm_start, size);
 	return 0;
 }
@@ -984,7 +978,7 @@ int mmap_communication_shared_space(struct file *filp, struct vm_area_struct *vm
 	uint64_t com_mmap_pfn = ((uint64_t)virt_to_phys(com_mmap_virt)) >> PAGE_SHIFT;
 	int ret;
 
-	vma->vm_flags |= VM_RESERVED;
+	vm_flags_set(vma, VM_RESERVED);
 	ret = remap_pfn_range(vma, vma->vm_start, com_mmap_pfn, size, vma->vm_page_prot);
 
 	if (ret != 0)
@@ -1128,15 +1122,12 @@ loff_t loopback_seek(struct file *file, loff_t offset, int whence)
 	DBG("loopback seek function!\n");
 	switch (whence) {
 	case SEEK_SET:
-		DBG("SEEK_SET\n");
 		new_pos = offset;
 		break;
 	case SEEK_CUR:
-		DBG("SEEK_CUR\n");
 		new_pos = file->f_pos + offset;
 		break;
 	case SEEK_END:
-		DBG("SEEK_END\n");
 		new_pos = file->f_inode->i_size;
 		break;
 	default:
@@ -1174,7 +1165,7 @@ static long loopback_ioctl(struct file *file,
 		userspace_task = pid_task(find_vpid(efd_data.pid), PIDTYPE_PID);
 
 		rcu_read_lock();
-		efd_file = fcheck_files(userspace_task->files, efd_data.efd[0]);
+		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
 		rcu_read_unlock();
 
 		efd_ctx = eventfd_ctx_fileget(efd_file);
@@ -1201,7 +1192,7 @@ static long loopback_ioctl(struct file *file,
 		 * a) vm_interrupt(NULL);
 		 * b) queue_work(interrupt_workqueue, &async_interrupt);
 		 */
-		queue_work(interrupt_workqueue, &async_interrupt);
+		vm_interrupt(NULL);
 		break;
 	case SHARE_VQS:
 		if (copy_from_user(&queue_sel, (uint32_t *) arg, sizeof(uint32_t)))
@@ -1234,17 +1225,16 @@ static long loopback_ioctl(struct file *file,
  */
 static int loopback_open(struct inode *inode, struct file *file)
 {
-		uint32_t val_1gb = 1024 * 1024 * 1024; // 1GB
+	uint32_t val_1gb = 1024 * 1024 * 1024; // 1GB
 
-		int ret;
 	/* Update the global variable, the driver is in use */
 	if (test_and_set_bit(IN_USE_BIT, &loopback_flags)) {
 		DBG("Driver is busy\n");
 		return -EBUSY;
 	}
 
-		/* Set the i_size for the stat SYS_CALL*/
-		file->f_inode->i_size = 10 * val_1gb;
+	/* Set the i_size for the stat SYS_CALL*/
+	file->f_inode->i_size = 10 * val_1gb;
 
 	/* Init mmap funcitonality */
 	info = kmalloc(sizeof(struct mmap_info), GFP_KERNEL);
@@ -1260,21 +1250,16 @@ static int loopback_open(struct inode *inode, struct file *file)
 	init_waitqueue_head(&wq_notify);
 
 	/* Create a workqueue for our char device */
-	notify_workqueue = create_singlethread_workqueue("notify_workqueue");
-	interrupt_workqueue = create_singlethread_workqueue("interrupt_workqueue");
+	//notify_workqueue = create_singlethread_workqueue("notify_workqueue");
+	notify_workqueue = create_workqueue("notify_workqueue");
+	//interrupt_workqueue = create_singlethread_workqueue("interrupt_workqueue");
+	interrupt_workqueue = create_workqueue("interrupt_workqueue");
 
 	/* Init mutex */
 	mutex_init(&read_write_lock);
 	mutex_init(&notify_lock);
 	mutex_init(&notify_q_lock);
 	mutex_init(&interrupt_lock);
-
-	/* Allocate memory for the FIFO using kfifo_alloc */
-	ret = kfifo_alloc(&notify_queue, KFIFO_SIZE, GFP_KERNEL);
-	if (ret) {
-		printk(KERN_ERR "Failed to allocate memory for kfifo\n");
-		return ret;
-	}
 
 	/* Init global variables */
 	mmap_index = 0;
@@ -1334,7 +1319,7 @@ static int __init loopback_init(void)
 
 	err = alloc_chrdev_region(&dev, 0, MAX_DEV, "loopback");
 	dev_major = MAJOR(dev);
-	loopback_class = class_create(THIS_MODULE, "loopback");
+	loopback_class = class_create("loopback");
 
 	for (i = 0; i < MAX_DEV; i++) {
 		cdev_init(&loopback_data[i].cdev, &fops);
