@@ -65,6 +65,7 @@
 #include <linux/pagemap.h>
 
 #include <linux/delay.h>
+#include <linux/version.h>
 
 /* Features */
 MODULE_LICENSE("GPL v2");
@@ -1165,8 +1166,11 @@ static long loopback_ioctl(struct file *file,
 		userspace_task = pid_task(find_vpid(efd_data.pid), PIDTYPE_PID);
 
 		rcu_read_lock();
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
 		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
+#else
 		rcu_read_unlock();
+#endif
 
 		efd_ctx = eventfd_ctx_fileget(efd_file);
 		if (!efd_ctx)
