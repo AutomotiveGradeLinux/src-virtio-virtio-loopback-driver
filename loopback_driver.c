@@ -476,8 +476,6 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned int in
 		goto error_new_virtqueue;
 	}
 
-	vq->num_max = num;
-
 	/* Activate the queue */
 	write_adapter(virtqueue_get_vring_size(vq), VIRTIO_MMIO_QUEUE_NUM, 4);
 	if (vm_dev->version == 1) {
@@ -949,7 +947,7 @@ int pf_mmap_vm_page(struct file *filp, struct vm_area_struct *vma)
 	uint64_t size = (unsigned long)(vma->vm_end - vma->vm_start);
 	uint64_t pfn = ((cur_ram_idx++) * 0x40000);
 
-	vm_flags_set(vma, VM_PFNMAP);
+	vma->vm_flags |= VM_PFNMAP;
 	add_share_mmap(filp, pfn, vma->vm_start, size);
 	return 0;
 }
@@ -979,7 +977,8 @@ int mmap_communication_shared_space(struct file *filp, struct vm_area_struct *vm
 	uint64_t com_mmap_pfn = ((uint64_t)virt_to_phys(com_mmap_virt)) >> PAGE_SHIFT;
 	int ret;
 
-	vm_flags_set(vma, VM_RESERVED);
+	vma->vm_flags |= VM_RESERVED;
+
 	ret = remap_pfn_range(vma, vma->vm_start, com_mmap_pfn, size, vma->vm_page_prot);
 
 	if (ret != 0)
@@ -1166,11 +1165,13 @@ static long loopback_ioctl(struct file *file,
 		userspace_task = pid_task(find_vpid(efd_data.pid), PIDTYPE_PID);
 
 		rcu_read_lock();
+
 #if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
-		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
+		efd_file = fcheck_files(userspace_task->files, efd_data.efd[0]);
 #else
-		rcu_read_unlock();
+		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
 #endif
+		rcu_read_unlock();
 
 		efd_ctx = eventfd_ctx_fileget(efd_file);
 		if (!efd_ctx)
@@ -1323,7 +1324,7 @@ static int __init loopback_init(void)
 
 	err = alloc_chrdev_region(&dev, 0, MAX_DEV, "loopback");
 	dev_major = MAJOR(dev);
-	loopback_class = class_create("loopback");
+	loopback_class = class_create(THIS_MODULE, "loopback");
 
 	for (i = 0; i < MAX_DEV; i++) {
 		cdev_init(&loopback_data[i].cdev, &fops);
