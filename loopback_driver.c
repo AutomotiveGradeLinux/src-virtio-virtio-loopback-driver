@@ -3,7 +3,7 @@
  * Based on virtio_mmio.c
  *   Copyright 2011-2014, ARM Ltd.
  *
- * Copyright 2022-2023 Virtual Open Systems SAS
+ * Copyright 2022-2024 Virtual Open Systems SAS
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,46 +26,25 @@
 #include <linux/eventfd.h>
 #include <linux/fdtable.h>
 #include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <linux/of_address.h>
-#include <linux/cpumask.h>
-#include <linux/smp.h>
+#include <linux/kernel.h>
+#include <linux/device.h>
 
-/* MMIO includes */
-#include <linux/acpi.h>
+/* Virtio-loopback includes */
 #include <linux/dma-mapping.h>
-#include <linux/highmem.h>
-#include <linux/io.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <uapi/linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
-
-#include <linux/kernel.h>
 #include <linux/pid.h>
-#include <linux/sched.h>
-#include <linux/rcupdate.h>
 #include <linux/kthread.h>
-
-/* mmap includes */
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/device.h>
-#include <linux/mutex.h>
 
 /* Loopback header file */
 #include "loopback_driver.h"
-
-#include <linux/pagemap.h>
-
-#include <linux/delay.h>
-#include <linux/version.h>
 
 /* Features */
 MODULE_LICENSE("GPL v2");
@@ -76,11 +55,7 @@ static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size);
 
 struct mmap_info *info;
 int mmap_index;
-int page_fault_index;
 uint64_t sum_pgfaults;
-
-virtio_device_info_struct_t device_info;
-virtio_neg_t device_neg = {.done = ATOMIC_INIT(0)};
 
 /* Waitq */
 wait_queue_head_t wq;
@@ -88,9 +63,10 @@ wait_queue_head_t wq_notify;
 
 /* Read write mutex */
 struct mutex read_write_lock;
-struct mutex notify_lock;
-struct mutex notify_q_lock;
 struct mutex interrupt_lock;
+
+/* Notification spinlock */
+spinlock_t notify_q_spinlock;
 
 bool share_communication_struct;
 uint32_t vq_index;
@@ -105,52 +81,27 @@ const struct vring *global_vring;
 static int interrupt_cnt;
 static int notify_sent, notify_received;
 
-/* Define a structure for your notify_list */
-struct notify_data {
-    uint32_t index;
-    struct list_head list;
-};
-static LIST_HEAD(notify_list);
-/* Define workqueues for notifications and interrupts */
-static struct workqueue_struct *notify_workqueue, *interrupt_workqueue;
+/* Define a notification list */
+static struct list_head *notify_list;
 
-static struct platform_device virtio_loopback_device = {
-	.name = "loopback-transport",
-	.id = -1,
-	.num_resources = 2,
-	.resource = (struct resource []) {
-		{
-			.start = 0xa003e00,
-			.end = 0xa003fff,
-			.flags = 0x200 /* IORESOURCE_MEM, */
-		}, {
-			.start = 0x2c,
-			.end = 0x2c,
-			.flags = 0x401 /* IORESOURCE_IRQ, */
-		},
-	}
-};
+static struct platform_device *virtio_loopback_device;
 
 /* Virio-loopback device funcitonality */
-struct task_struct *userspace_task;
-struct file *efd_file;
-struct file *efd_file_notify;
 struct eventfd_ctx *efd_ctx;
 static struct task_struct *start_loopback_thread;
+static struct task_struct *start_notification_thread;
 
 /* global storage for device Major number */
 static int dev_major;
 /* sysfs class structure */
 static struct class *loopback_class;
 /* array of loopback_device_data for */
-static struct loopback_device_data loopback_data[MAX_DEV];
+static struct loopback_device_data *loopback_data;
 
 /* Allow only one process to open the driver */
 unsigned long loopback_flags;
-#define IN_USE_BIT 0
 
-int32_t notified_vq_index;
-int notify_flag;
+/* Current ram index */
 int cur_ram_idx;
 
 /*
@@ -159,17 +110,9 @@ int cur_ram_idx;
  * eventfd. If it's equal to "false" then the oparetion
  * does not wait for adapter's confirmation.
  */
-bool valid_eventfd = true;
+bool valid_eventfd;
 
-
-/* mmap functionality related structures */
-struct share_mmap {
-	uint64_t pfn;
-	uint64_t vm_start;
-	uint32_t size;
-	uint32_t uid;
-	struct page *page;
-};
+/* Create a mapping array */
 struct share_mmap share_mmap_list[MMAP_LIMIT];
 
 /* Configuration interface */
@@ -323,47 +266,58 @@ static void vm_reset(struct virtio_device *vdev)
 	write_adapter(0, VIRTIO_MMIO_STATUS, 4);
 }
 
-static void async_work_handler(struct work_struct *work)
+int start_notification(void *data)
 {
-	struct notify_data *entry, *tmp;
+	struct notify_data *first_notification;
+	uint32_t index;
 
-	mutex_lock(&notify_q_lock);
-    list_for_each_entry_safe(entry, tmp, &notify_list, list) {
-		pr_crit("notify_received: %d, VQ: %d\n", notify_received++, entry->index);
-		write_adapter(entry->index, VIRTIO_MMIO_QUEUE_NOTIFY, 4);
-        list_del(&entry->list);
-        kfree(entry);
-    }
-	mutex_unlock(&notify_q_lock);
+	DBG("Start notification\n");
 
+	(void)data;
+
+	while(1) {
+
+		spin_lock(&notify_q_spinlock);
+		while (valid_eventfd && list_empty(notify_list) == 1) {
+			spin_unlock(&notify_q_spinlock);
+			wait_event_timeout(wq_notify, list_empty(notify_list) != 1, 1 * HZ);
+			spin_lock(&notify_q_spinlock);
+		}
+
+		first_notification = list_first_entry(notify_list, struct notify_data, list);
+		index = first_notification->index;
+		list_del(&first_notification->list);
+
+		DBG("notify_received: %d, VQ: %d\n", notify_received++, index);
+		spin_unlock(&notify_q_spinlock);
+		write_adapter(index, VIRTIO_MMIO_QUEUE_NOTIFY, 4);
+
+		if (!valid_eventfd) {
+			DBG("Exit notification thread\n");
+			return 0;
+		}
+	}
 }
-
-DECLARE_WORK(async_work, async_work_handler);
 
 /* the notify function used when creating a virt queue */
 static bool vm_notify(struct virtqueue *vq)
 {
-	//uint32_t ret, prev_len, vq_index;
 	struct notify_data *data;
 	/*
 	 * We write the queue's selector into
 	 * the notification register to signal
 	 * the other end
 	 */
-	mutex_lock(&notify_q_lock);
-	pr_crit("vm_notify\n");
+	spin_lock(&notify_q_spinlock);
+	DBG("vm_notify\n");
 
 	data = kmalloc(sizeof(struct notify_data), GFP_KERNEL);
 	data->index = vq->index;
 	INIT_LIST_HEAD(&data->list);
-	list_add_tail(&data->list, &notify_list);
+	list_add_tail(&data->list, notify_list);
+	spin_unlock(&notify_q_spinlock);
 
-
-	/* This doesn't make any difference in or out of the block */
-	if (!queue_work(notify_workqueue, &async_work)) {
-		pr_info("Fails to start work_queue, but no problem\n");
-	}
-	mutex_unlock(&notify_q_lock);
+	wake_up(&wq_notify);
 
 	return true;
 }
@@ -378,7 +332,7 @@ static void vm_interrupt(struct work_struct *work)
 
 	/* STATUS and ACK should ne done without any intermediate status change */
 	mutex_lock(&interrupt_lock);
-	pr_crit("interrupt_cnt: %d\n", interrupt_cnt++);
+	DBG("interrupt_cnt: %d\n", interrupt_cnt++);
 
 	/* Read and acknowledge interrupts */
 	status = read_adapter(VIRTIO_MMIO_INTERRUPT_STATUS, 4);
@@ -396,7 +350,6 @@ static void vm_interrupt(struct work_struct *work)
 	}
 	mutex_unlock(&interrupt_lock);
 }
-DECLARE_WORK(async_interrupt, vm_interrupt);
 
 static void vm_del_vq(struct virtqueue *vq)
 {
@@ -732,176 +685,11 @@ static struct platform_driver virtio_mmio_driver = {
 	},
 };
 
-/*
- * This functions registers all mmap calls done by the user-space into an array
- */
-void add_share_mmap(struct file *filp, uint64_t pfn, uint64_t vm_start, uint64_t size)
-{
-	DBG("Add new mmaping! index: %d\n", mmap_index);
-	DBG("pfn: 0x%llx", pfn);
-	DBG("vm_start: 0x%llx", vm_start);
-	DBG("size: 0x%llx", size);
-
-	share_mmap_list[mmap_index].pfn = pfn;
-	share_mmap_list[mmap_index].vm_start = vm_start;
-	share_mmap_list[mmap_index].size = size;
-	share_mmap_list[mmap_index].uid = task_pid_nr(current);
-	mmap_index++;
-}
-
-/*
- * This functions removes a record from mmap array
- */
-void share_mmap_rem(struct vm_area_struct *vma)
-{
-	int i;
-
-	for (i = 0; i < MMAP_LIMIT; i++) {
-		if (share_mmap_list[i].vm_start == vma->vm_start) {
-			DBG("share_mmap with pa: 0x%llx and size: %x is deleted from the list\n",
-					 share_mmap_list[i].pfn, share_mmap_list[i].size);
-			share_mmap_list[i].uid = 0;
-			share_mmap_list[i].pfn = 0;
-			share_mmap_list[i].vm_start = 0;
-			share_mmap_list[i].size = 0;
-		}
-	}
-}
-
-void print_mmap_idx(int i)
-{
-	DBG("share_mmap_list[%d].uid %x\n", i, share_mmap_list[i].uid);
-	DBG("share_mmap_list[%d].pfn %llx\n", i, share_mmap_list[i].pfn);
-	DBG("share_mmap_list[%d].vm_start %llx\n", i, share_mmap_list[i].vm_start);
-	DBG("share_mmap_list[%d].size %x\n", i, share_mmap_list[i].size);
-}
-
-void print_mmaps(void)
-{
-	int i;
-	int limit = mmap_index == 0 ? MMAP_LIMIT : mmap_index;
-
-	for (i = 0; i < limit; i++)
-		print_mmap_idx(i);
-
-}
-
-/*
- * This function return the corresponding pfn of a user-space address
- * based on the mapping done during the initialization
- */
-uint64_t share_mmap_exist_vma_return_correct_addr(uint64_t pfn)
-{
-	int i;
-	uint64_t corrected_addr;
-
-	for (i = 0; i < MMAP_LIMIT; i++) {
-		if ((share_mmap_list[i].pfn <= pfn) &&
-			(pfn < share_mmap_list[i].pfn + (share_mmap_list[i].size >> PAGE_SHIFT)) &&
-			(share_mmap_list[i].uid == task_pid_nr(current))) {
-			DBG("pfn (0x%llx) exist in: 0x%llx - 0x%llx\n", pfn, share_mmap_list[i].pfn,
-				share_mmap_list[i].pfn + (share_mmap_list[i].size >> PAGE_SHIFT));
-			corrected_addr = ((pfn - share_mmap_list[i].pfn) << PAGE_SHIFT) + share_mmap_list[i].vm_start;
-			DBG("The return addr is: 0x%llx\n", corrected_addr);
-			return corrected_addr;
-		}
-	}
-	return 0;
-}
-
-/*
- * This function return the corresponding user-space address of a pfn
- * based on the mapping done during the initialization
- */
-uint64_t share_mmap_exist_vma_return_correct_pfn(uint64_t addr)
-{
-	int i;
-	uint64_t corrected_pfn;
-
-	for (i = 0; i < MMAP_LIMIT; i++) {
-		if ((share_mmap_list[i].vm_start <= addr) &&
-			(addr < share_mmap_list[i].vm_start + share_mmap_list[i].size)) {
-			DBG("addr (0x%llx) exist in: 0x%llx - 0x%llx\n", addr, share_mmap_list[i].vm_start,
-				share_mmap_list[i].vm_start + share_mmap_list[i].size);
-			DBG("((addr - share_mmap_list[i].vm_start) / PAGE_SIZE): 0x%llx\n",
-											((addr - share_mmap_list[i].vm_start) / PAGE_SIZE));
-			DBG("share_mmap_list[i].pfn: 0x%llx\n", share_mmap_list[i].pfn);
-			corrected_pfn = ((addr - share_mmap_list[i].vm_start) / PAGE_SIZE) + share_mmap_list[i].pfn;
-			return corrected_pfn;
-		}
-	}
-	return 0;
-}
-
-/*
- * This function returns the size of memory block area referrenced by the vrings
- */
-uint64_t share_mmap_exist_vma_vring_size(uint64_t insert_pfn)
-{
-	int i = 0;
-	uint64_t next_pfn, mem_blk_size;
-
-	while (((vring_desc_t)global_vring->desc[i]).addr != 0) {
-
-		/* Get the current value of pfn and its size */
-		next_pfn = ((vring_desc_t)global_vring->desc[i]).addr >> PAGE_SHIFT;
-		mem_blk_size = ((vring_desc_t)global_vring->desc[i]).len;
-
-		/* Check if the insert_pfn is found */
-		if (insert_pfn == next_pfn) {
-
-			DBG("Found 0x%llx into the vring\n", insert_pfn);
-			/* Formalize the mem_blk_size to be multiple of PAGE_SIZE */
-			mem_blk_size = mem_blk_size % PAGE_SIZE ?
-					(mem_blk_size & PAGE_MASK) + PAGE_SIZE : mem_blk_size;
-			DBG("The formalized size is %llu\n", mem_blk_size);
-
-			return mem_blk_size;
-		}
-
-		/* Go to next element into the vring array */
-		i++;
-	}
-
-	return PAGE_SIZE;
-}
-
-/*
- * This function tries to insert multiple PFNs into the user-space process.
- * The pfn of the starting page is given as an argument and the number of
- * pages to be inserted is calculated based on the memory block length found into
- * the vrings.
- */
-void vmf_insert_vring_pfns(struct vm_area_struct *vma, uint64_t vaddr, uint64_t insert_pfn)
-{
-	int i, page_num, ret;
-	uint64_t mem_blk_size;
-
-	/* Formalize the mem_blk_size to be multiple of PAGE_SIZE */
-	mem_blk_size = share_mmap_exist_vma_vring_size(insert_pfn);
-
-	page_num = mem_blk_size / PAGE_SIZE;
-	DBG("page_num: %u, need to be inserted\n", page_num);
-
-	for (i = 0; i < page_num; i++) {
-		DBG("\tTry to insert 0x%llx pfn into vaddr: 0x%llx with size of 0x%llx\n", insert_pfn, vaddr, mem_blk_size);
-		if (!pfn_valid(insert_pfn))
-			break;
-
-		ret = vmf_insert_pfn(vma, vaddr, insert_pfn);
-		DBG("vmf_insert_pfn returns: 0x%x\n", ret);
-
-		/* Go to the next page of the memory block */
-		vaddr += PAGE_SIZE;
-		insert_pfn++;
-	}
-}
-
 void pf_mmap_close(struct vm_area_struct *vma)
 {
 	DBG("unmap\t-> vma->vm_start: 0x%lx\n", vma->vm_start);
 	DBG("unmap\t-> size: %lu\n", vma->vm_end - vma->vm_start);
-	share_mmap_rem(vma);
+	share_mmap_rem(vma, share_mmap_list);
 }
 
 vm_fault_t pf_mmap_fault(struct vm_fault *vmf)
@@ -914,7 +702,7 @@ vm_fault_t pf_mmap_fault(struct vm_fault *vmf)
 	DBG("----- Page fault: %lld -----\n", sum_pgfaults++);
 
 	/* Find the corrected pfn */
-	corrected_pfn = share_mmap_exist_vma_return_correct_pfn(vmf->address);
+	corrected_pfn = share_mmap_exist_vma_return_correct_pfn(vmf->address, share_mmap_list);
 	corr_pfn_struct.val = corrected_pfn;
 
 	/* Some debug prints */
@@ -947,44 +735,13 @@ int pf_mmap_vm_page(struct file *filp, struct vm_area_struct *vma)
 	uint64_t size = (unsigned long)(vma->vm_end - vma->vm_start);
 	uint64_t pfn = ((cur_ram_idx++) * 0x40000);
 
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
 	vma->vm_flags |= VM_PFNMAP;
-	add_share_mmap(filp, pfn, vma->vm_start, size);
+#else
+	vm_flags_set(vma, VM_PFNMAP);
+#endif
+	add_share_mmap(filp, pfn, vma->vm_start, size, share_mmap_list, &mmap_index);
 	return 0;
-}
-
-int mmap_mix(struct file *filp, struct vm_area_struct *vma)
-{
-	int ret = 0;
-	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
-
-	ret = remap_pfn_range(vma, vma->vm_start, vq_pfn, size, vma->vm_page_prot);
-	if (ret != 0) {
-		DBG("Mmap error\n");
-		print_mmaps();
-		goto out;
-	}
-
-	add_share_mmap(filp, vq_pfn, vma->vm_start, size);
-
-out:
-	return ret;
-}
-
-int mmap_communication_shared_space(struct file *filp, struct vm_area_struct *vma)
-{
-	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
-	struct mmap_info *com_mmap_virt = ((struct mmap_info *)(filp->private_data))->data;
-	uint64_t com_mmap_pfn = ((uint64_t)virt_to_phys(com_mmap_virt)) >> PAGE_SHIFT;
-	int ret;
-
-	vma->vm_flags |= VM_RESERVED;
-
-	ret = remap_pfn_range(vma, vma->vm_start, com_mmap_pfn, size, vma->vm_page_prot);
-
-	if (ret != 0)
-		DBG("Error to mmap communication shared space\n");
-
-	return ret;
 }
 
 int op_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -996,23 +753,21 @@ int op_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	if (share_communication_struct) {
 		DBG("MMAP communication struct\n");
-		ret = mmap_communication_shared_space(filp, vma);
+		ret = mmap_communication_shared_space(filp, vma, share_mmap_list, &mmap_index);
 		share_communication_struct = false;
 		goto out;
 	}
 
 	if (size > PAGE_SIZE * 100) {
-		vma->vm_ops = &pf_mmap_ops;
 		ret = pf_mmap_vm_page(filp, vma);
 		goto out;
 	}
 
-	vma->vm_ops = &pf_mmap_ops;
-	ret = mmap_mix(filp, vma);
+	ret = mmap_mix(filp, vma, share_mmap_list, &mmap_index, vq_pfn);
 
 out:
+	vma->vm_ops = &pf_mmap_ops;
 	return ret;
-
 }
 
 static uint64_t read_adapter(uint64_t fn_id, uint64_t size)
@@ -1131,7 +886,7 @@ loff_t loopback_seek(struct file *file, loff_t offset, int whence)
 		new_pos = file->f_inode->i_size;
 		break;
 	default:
-		return -EINVAL; // Invalid whence value
+		return -EINVAL;
 	}
 
 	if (new_pos < 0 || new_pos > file->f_inode->i_size)
@@ -1145,7 +900,6 @@ int start_loopback(void *data)
 	(void)data;
 	/* Register mmio_trasmport */
 	(void)platform_driver_register(&virtio_mmio_driver);
-	(void)platform_device_register(&virtio_loopback_device);
 	return 0;
 }
 
@@ -1153,6 +907,8 @@ static long loopback_ioctl(struct file *file,
 				unsigned int cmd, unsigned long arg)
 {
 	efd_data_t efd_data;
+	struct task_struct *userspace_task;
+	struct file *efd_file;
 	int irq;
 	uint32_t queue_sel;
 
@@ -1165,12 +921,7 @@ static long loopback_ioctl(struct file *file,
 		userspace_task = pid_task(find_vpid(efd_data.pid), PIDTYPE_PID);
 
 		rcu_read_lock();
-
-#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
-		efd_file = fcheck_files(userspace_task->files, efd_data.efd[0]);
-#else
 		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
-#endif
 		rcu_read_unlock();
 
 		efd_ctx = eventfd_ctx_fileget(efd_file);
@@ -1183,9 +934,7 @@ static long loopback_ioctl(struct file *file,
 		wake_up(&wq);
 		break;
 	case START_LOOPBACK:
-		if (copy_from_user(&device_info, (virtio_device_info_struct_t *) arg,
-						   sizeof(virtio_device_info_struct_t)))
-			return -EFAULT;
+		start_notification_thread = kthread_run(start_notification, NULL, "start_notification");
 		start_loopback_thread = kthread_run(start_loopback, NULL, "start_loopback");
 		break;
 	case IRQ:
@@ -1193,7 +942,8 @@ static long loopback_ioctl(struct file *file,
 			return -EFAULT;
 		DBG("\nIRQ\n");
 		/*
-		 * Both ot the interrupt ways work but b) has better performance
+		 * Both of the interrupt ways work but a) is more stable
+		 * and b) has better performance:
 		 * a) vm_interrupt(NULL);
 		 * b) queue_work(interrupt_workqueue, &async_interrupt);
 		 */
@@ -1205,12 +955,6 @@ static long loopback_ioctl(struct file *file,
 		DBG("\n\nSHARE_VQS: %u\n\n", queue_sel);
 		vq_pfn = vq_pfns[queue_sel];
 		DBG("Selected pfn is: 0x%llx", vq_pfn);
-		break;
-	case SHARE_BUF:
-		if (copy_from_user(&vq_pfn, (uint64_t *) arg, sizeof(uint64_t)))
-			return -EFAULT;
-		DBG("\n\nSHARE_BUF -> vq_pfn: 0x%llx\n", vq_pfn);
-		vq_pfn = vq_pfn >> PAGE_SHIFT;
 		break;
 	case SHARE_COM_STRUCT:
 		share_communication_struct = true;
@@ -1231,6 +975,7 @@ static long loopback_ioctl(struct file *file,
 static int loopback_open(struct inode *inode, struct file *file)
 {
 	uint32_t val_1gb = 1024 * 1024 * 1024; // 1GB
+	virtio_neg_t device_neg = {.done = ATOMIC_INIT(0)};
 
 	/* Update the global variable, the driver is in use */
 	if (test_and_set_bit(IN_USE_BIT, &loopback_flags)) {
@@ -1244,35 +989,25 @@ static int loopback_open(struct inode *inode, struct file *file)
 	/* Init mmap funcitonality */
 	info = kmalloc(sizeof(struct mmap_info), GFP_KERNEL);
 	info->data = (void *)get_zeroed_page(GFP_KERNEL);
-
 	memcpy(info->data, &device_neg, sizeof(virtio_neg_t));
 
 	/* assign this info struct to the file */
 	file->private_data = info;
 
-	/* Init wq */
-	init_waitqueue_head(&wq);
-	init_waitqueue_head(&wq_notify);
-
-	/* Create a workqueue for our char device */
-	//notify_workqueue = create_singlethread_workqueue("notify_workqueue");
-	notify_workqueue = create_workqueue("notify_workqueue");
-	//interrupt_workqueue = create_singlethread_workqueue("interrupt_workqueue");
-	interrupt_workqueue = create_workqueue("interrupt_workqueue");
-
-	/* Init mutex */
-	mutex_init(&read_write_lock);
-	mutex_init(&notify_lock);
-	mutex_init(&notify_q_lock);
-	mutex_init(&interrupt_lock);
+	/* Init notification list */
+	notify_list = kmalloc(sizeof(struct list_head), GFP_KERNEL);
+	if (!notify_list) {
+		printk(KERN_ERR "Failed to allocate memory for list head\n");
+		return 1;
+	}
+	INIT_LIST_HEAD(notify_list);
 
 	/* Init global variables */
 	mmap_index = 0;
-	page_fault_index = 0;
 	sum_pgfaults = 0;
 	share_communication_struct = false;
+	valid_eventfd = true;
 	vq_index = 0;
-	notify_flag = 0;
 	cur_ram_idx = 0;
 	interrupt_cnt = 0;
 	notify_sent = 0;
@@ -1283,18 +1018,9 @@ static int loopback_open(struct inode *inode, struct file *file)
 
 static int loopback_release(struct inode *inode, struct file *file)
 {
-	/* TODO:
-	 * struct mmap_info *info = file->private_data;
-	 * free_page((unsigned long)info->data);
-	 * kfree(info);
-	 * file->private_data = NULL;
-	 */
-	DBG("Release the device\n");
+	int i;
 
-	/* Update the global variable, the driver is not in use */
-	smp_mb__before_atomic();
-	clear_bit(IN_USE_BIT, &loopback_flags);
-	DBG("clear_bit!\n");
+	DBG("Release the device\n");
 
 	/*
 	 * This make the read/write do not wait
@@ -1303,34 +1029,85 @@ static int loopback_release(struct inode *inode, struct file *file)
 	 */
 	valid_eventfd = false;
 
+	/* Unegister mmio_trasmport */
+	platform_driver_unregister(&virtio_mmio_driver);
+	DBG("platform_driver_unregister!\n");
+
+	/* free communication structure */
+	free_page((unsigned long)info->data);
+	kfree(info);
+	file->private_data = NULL;
+	DBG("Clean private_data\n");
+
+	/* Clear share_mmap_list */
+	for(i = 0; i < MMAP_LIMIT; i++) {
+		share_mmap_list[i].uid = 0;
+		share_mmap_list[i].pfn = 0;
+		share_mmap_list[i].vm_start = 0;
+		share_mmap_list[i].size = 0;
+	}
+
+	/* Update the global variable, the driver is not in use */
+	smp_mb__before_atomic();
+	clear_bit(IN_USE_BIT, &loopback_flags);
+	DBG("clear_bit!\n");
+
 	return 0;
 }
 
 static const struct file_operations fops = {
-	.owner		= THIS_MODULE,
-	.read		= loopback_read,
-	.write		= loopback_write,
-	.open		= loopback_open,
+	.owner			= THIS_MODULE,
+	.read			= loopback_read,
+	.write			= loopback_write,
+	.open			= loopback_open,
 	.unlocked_ioctl = loopback_ioctl,
-	.mmap		= op_mmap,
-	.llseek = loopback_seek,
-	.release	= loopback_release
+	.mmap			= op_mmap,
+	.llseek 		= loopback_seek,
+	.release		= loopback_release
 };
 
 static int __init loopback_init(void)
 {
-	int err, i;
+	int err;
 	dev_t dev;
 
 	err = alloc_chrdev_region(&dev, 0, MAX_DEV, "loopback");
 	dev_major = MAJOR(dev);
-	loopback_class = class_create(THIS_MODULE, "loopback");
 
-	for (i = 0; i < MAX_DEV; i++) {
-		cdev_init(&loopback_data[i].cdev, &fops);
-		loopback_data[i].cdev.owner = THIS_MODULE;
-		cdev_add(&loopback_data[i].cdev, MKDEV(dev_major, i), 1);
-		device_create(loopback_class, NULL, MKDEV(dev_major, i), NULL, "loopback");
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
+	loopback_class = class_create(THIS_MODULE, "loopback");
+#else
+	loopback_class = class_create("loopback");
+#endif
+	if (IS_ERR(loopback_class)) {
+			printk(KERN_ERR "Failed to create class\n");
+			return PTR_ERR(loopback_class);
+	}
+
+	loopback_data = (struct loopback_device_data *)kmalloc(
+						sizeof(struct loopback_device_data), GFP_KERNEL);
+
+	cdev_init(&loopback_data->cdev, &fops);
+	loopback_data->cdev.owner = THIS_MODULE;
+	cdev_add(&loopback_data->cdev, MKDEV(dev_major, 0), 1);
+	device_create(loopback_class, NULL, MKDEV(dev_major, 0), NULL, "loopback");
+
+	/* Init wq */
+	init_waitqueue_head(&wq);
+	init_waitqueue_head(&wq_notify);
+
+	/* Init mutex */
+	mutex_init(&read_write_lock);
+	mutex_init(&interrupt_lock);
+
+	/* Init spinlock */
+	spin_lock_init(&notify_q_spinlock);
+
+	virtio_loopback_device = platform_device_register_simple("loopback-transport", -1, NULL, 0);
+	if (IS_ERR(virtio_loopback_device)) {
+		err = PTR_ERR(virtio_loopback_device);
+		pr_err("failed to register loopback-transport device: %d\n", err);
+		return err;
 	}
 
 	return 0;
@@ -1338,26 +1115,21 @@ static int __init loopback_init(void)
 
 void __exit loopback_exit(void)
 {
-	int i;
-
 	DBG("Exit driver!\n");
 
 	/* Unegister loopback device */
-	platform_device_del(&virtio_loopback_device);
+	platform_device_unregister(virtio_loopback_device);
+	DBG("platform_device_unregister!\n");
 
-	DBG("platform_device_del!\n");
-	/* Unegister mmio_trasmport */
-	platform_driver_unregister(&virtio_mmio_driver);
-	DBG("platform_driver_unregister!\n");
-
-	for (i = 0; i < MAX_DEV; i++) {
-		device_destroy(loopback_class, MKDEV(dev_major, i));
-		cdev_del(&loopback_data[i].cdev);
-	}
+	device_destroy(loopback_class, MKDEV(dev_major, 0));
+	cdev_del(&loopback_data->cdev);
 	DBG("device_destroy!\n");
 
 	class_destroy(loopback_class);
 	DBG("class_destroy!\n");
+
+	kfree(loopback_data);
+	DBG("Free resources");
 }
 
 module_init(loopback_init);
