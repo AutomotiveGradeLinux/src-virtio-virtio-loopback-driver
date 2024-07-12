@@ -24,6 +24,8 @@
 
 #define DRIVER	"LOOPBACK"
 
+#include <linux/version.h>
+
 /* max Minor devices */
 #define MAX_DEV	1
 
@@ -348,7 +350,12 @@ int mmap_communication_shared_space(struct file *filp, struct vm_area_struct *vm
     uint64_t com_mmap_pfn = ((uint64_t)virt_to_phys(com_mmap_virt)) >> PAGE_SHIFT;
     int ret;
 
-    vm_flags_set(vma, VM_RESERVED);
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,16,0)
+	vma->vm_flags |= VM_RESERVED;
+#else
+        vm_flags_set(vma, VM_RESERVED);
+#endif
+
     ret = remap_pfn_range(vma, vma->vm_start, com_mmap_pfn, size, vma->vm_page_prot);
 
     if (ret != 0) {

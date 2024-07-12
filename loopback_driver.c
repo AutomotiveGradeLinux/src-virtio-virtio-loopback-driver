@@ -30,6 +30,8 @@
 #include <linux/platform_device.h>
 #include <linux/kernel.h>
 #include <linux/device.h>
+#include <linux/version.h>
+#include <linux/slab.h>
 
 /* Virtio-loopback includes */
 #include <linux/dma-mapping.h>
@@ -429,6 +431,10 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned int in
 		goto error_new_virtqueue;
 	}
 
+
+#if LINUX_VERSION_CODE >  KERNEL_VERSION(6,0,0)
+	vq->num_max = num;
+#endif
 	/* Activate the queue */
 	write_adapter(virtqueue_get_vring_size(vq), VIRTIO_MMIO_QUEUE_NUM, 4);
 	if (vm_dev->version == 1) {
@@ -735,7 +741,7 @@ int pf_mmap_vm_page(struct file *filp, struct vm_area_struct *vma)
 	uint64_t size = (unsigned long)(vma->vm_end - vma->vm_start);
 	uint64_t pfn = ((cur_ram_idx++) * 0x40000);
 
-#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(6,3,0)
 	vma->vm_flags |= VM_PFNMAP;
 #else
 	vm_flags_set(vma, VM_PFNMAP);
@@ -921,7 +927,13 @@ static long loopback_ioctl(struct file *file,
 		userspace_task = pid_task(find_vpid(efd_data.pid), PIDTYPE_PID);
 
 		rcu_read_lock();
+
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,220)
+		efd_file = fcheck_files(userspace_task->files, efd_data.efd[0]);
+#else
 		efd_file = files_lookup_fd_rcu(userspace_task->files, efd_data.efd[0]);
+#endif
+
 		rcu_read_unlock();
 
 		efd_ctx = eventfd_ctx_fileget(efd_file);
@@ -1074,7 +1086,7 @@ static int __init loopback_init(void)
 	err = alloc_chrdev_region(&dev, 0, MAX_DEV, "loopback");
 	dev_major = MAJOR(dev);
 
-#if LINUX_VERSION_CODE <  KERNEL_VERSION(5,11,0)
+#if LINUX_VERSION_CODE <  KERNEL_VERSION(6,4,0)
 	loopback_class = class_create(THIS_MODULE, "loopback");
 #else
 	loopback_class = class_create("loopback");
