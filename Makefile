@@ -15,15 +15,16 @@
 # Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 #
 
-NAME_C=loopback_driver
-
 LINUX_DIR ?= /lib/modules/$(shell uname -r)/build
 
-obj-m += $(NAME_C).o
+virtio_loopback-objs := virtio_loopback_driver.o virtio_loopback_device.o
+obj-m += virtio_loopback.o
 
 ifeq ($(DEBUG), 1)
  ccflags-y += -DDEBUG
 endif
+
+CFLAGS := -Wall -Wextra -Werror
 
 all:
 	make -C $(LINUX_DIR) M=$(PWD) modules
