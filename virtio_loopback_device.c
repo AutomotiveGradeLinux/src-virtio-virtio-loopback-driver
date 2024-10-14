@@ -1,9 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * Virtio loopback transport driver
+ *
  * Based on virtio_mmio.c
  *   Copyright 2011-2014, ARM Ltd.
  *
  * Copyright 2022-2024 Virtual Open Systems SAS
+ *
+ * Authors:
+ *  Timos Ampelikiotis <t.ampelikiotis@virtualopensystems.com>
+ *  Anna Panagopoulou <anna@virtualopensystems.com>
+ *  Alvise Rigo <a.rigo@virtualopensystems.com>
+ *
+ * This module allows virtio devices to be used in a non-virtualized
+ * environment, coupled with vhost-user device (user-space drivers).
+ *
+ * It is set as a transport driver by the virtio-loopback device
+ * driver for a group of virtio drivers and reroutes all read/write
+ * operations to the userspace. In user-space, virtio-loopback adapter
+ * (the user-space component of the design) handles the read/write ops
+ * translates them into the corresponding vhost-user messages and
+ * forwards them to the corresponding vhost-user device.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -14,10 +31,6 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  */
 
 #define pr_fmt(fmt) "virtio-loopback-transport: " fmt
@@ -33,104 +46,105 @@ static void print_neg_flag(uint64_t neg_flag, bool read)
 		pr_debug("Write:\n");
 
 	switch (neg_flag) {
-	case VIRTIO_MMIO_MAGIC_VALUE:			//0x000
+	case VIRTIO_MMIO_MAGIC_VALUE:
 		pr_debug("\tVIRTIO_MMIO_MAGIC_VALUE\n");
 		break;
-	case VIRTIO_MMIO_VERSION:				//0x004
+	case VIRTIO_MMIO_VERSION:
 		pr_debug("\tVIRTIO_MMIO_VERSION\n");
 		break;
-	case VIRTIO_MMIO_DEVICE_ID:				//0x008
+	case VIRTIO_MMIO_DEVICE_ID:
 		pr_debug("\tVIRTIO_MMIO_DEVICE_ID\n");
 		break;
-	case VIRTIO_MMIO_VENDOR_ID:				//0x00c
+	case VIRTIO_MMIO_VENDOR_ID:
 		pr_debug("\tVIRTIO_MMIO_VENDOR_ID\n");
 		break;
-	case VIRTIO_MMIO_DEVICE_FEATURES:		//0x010
+	case VIRTIO_MMIO_DEVICE_FEATURES:
 		pr_debug("\tVIRTIO_MMIO_DEVICE_FEATURES\n");
 		break;
-	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:	//0x014
+	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
 		pr_debug("\tVIRTIO_MMIO_DEVICE_FEATURES_SEL\n");
 		break;
-	case VIRTIO_MMIO_DRIVER_FEATURES:		//0x020
+	case VIRTIO_MMIO_DRIVER_FEATURES:
 		pr_debug("\tVIRTIO_MMIO_DRIVER_FEATURES\n");
 		break;
-	case VIRTIO_MMIO_DRIVER_FEATURES_SEL:	//0x024
+	case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
 		pr_debug("\tVIRTIO_MMIO_DRIVER_FEATURES_SEL\n");
 		break;
-	case VIRTIO_MMIO_GUEST_PAGE_SIZE:		//0x028
+	case VIRTIO_MMIO_GUEST_PAGE_SIZE:
 		pr_debug("\tVIRTIO_MMIO_GUEST_PAGE_SIZE\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_SEL:				//0x030
+	case VIRTIO_MMIO_QUEUE_SEL:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_SEL\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_NUM_MAX:			//0x034
+	case VIRTIO_MMIO_QUEUE_NUM_MAX:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_NUM_MAX\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_NUM:				//0x038
+	case VIRTIO_MMIO_QUEUE_NUM:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_NUM\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_ALIGN:			//0x03c
+	case VIRTIO_MMIO_QUEUE_ALIGN:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_ALIGN\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_PFN:				//0x040
+	case VIRTIO_MMIO_QUEUE_PFN:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_PFN\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_READY:			//0x044
+	case VIRTIO_MMIO_QUEUE_READY:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_READY\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_NOTIFY:			//0x050
+	case VIRTIO_MMIO_QUEUE_NOTIFY:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_NOTIFY\n");
 		break;
-	case VIRTIO_MMIO_INTERRUPT_STATUS:		//0x060
+	case VIRTIO_MMIO_INTERRUPT_STATUS:
 		pr_debug("\tVIRTIO_MMIO_INTERRUPT_STATUS\n");
 		break;
-	case VIRTIO_MMIO_INTERRUPT_ACK:			//0x064
+	case VIRTIO_MMIO_INTERRUPT_ACK:
 		pr_debug("\tVIRTIO_MMIO_INTERRUPT_ACK\n");
 		break;
-	case VIRTIO_MMIO_STATUS:				//0x070
+	case VIRTIO_MMIO_STATUS:
 		pr_debug("\tVIRTIO_MMIO_STATUS\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_DESC_LOW:		//0x080
+	case VIRTIO_MMIO_QUEUE_DESC_LOW:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_DESC_LOW\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_DESC_HIGH:		//0x084
+	case VIRTIO_MMIO_QUEUE_DESC_HIGH:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_DESC_HIGH\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_AVAIL_LOW:		//0x090
+	case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_AVAIL_LOW\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:		//0x094
+	case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_AVAIL_HIGH\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_USED_LOW:		//0x0a0
+	case VIRTIO_MMIO_QUEUE_USED_LOW:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_USED_LOW\n");
 		break;
-	case VIRTIO_MMIO_QUEUE_USED_HIGH:		//0x0a4
+	case VIRTIO_MMIO_QUEUE_USED_HIGH:
 		pr_debug("\tVIRTIO_MMIO_QUEUE_USED_HIGH\n");
 		break;
-	case VIRTIO_MMIO_SHM_SEL:				//0x0ac
+	case VIRTIO_MMIO_SHM_SEL:
 		pr_debug("\tVIRTIO_MMIO_SHM_SEL\n");
 		break;
-	case VIRTIO_MMIO_SHM_LEN_LOW:			//0x0b0
+	case VIRTIO_MMIO_SHM_LEN_LOW:
 		pr_debug("\tVIRTIO_MMIO_SHM_LEN_LOW\n");
 		break;
-	case VIRTIO_MMIO_SHM_LEN_HIGH:			//0x0b4
+	case VIRTIO_MMIO_SHM_LEN_HIGH:
 		pr_debug("\tVIRTIO_MMIO_SHM_LEN_HIGH\n");
 		break;
-	case VIRTIO_MMIO_SHM_BASE_LOW:			//0x0b8
+	case VIRTIO_MMIO_SHM_BASE_LOW:
 		pr_debug("\tVIRTIO_MMIO_SHM_BASE_LOW\n");
 		break;
-	case VIRTIO_MMIO_SHM_BASE_HIGH:			//0x0bc
+	case VIRTIO_MMIO_SHM_BASE_HIGH:
 		pr_debug("\tVIRTIO_MMIO_SHM_BASE_HIGH\n");
 		break;
-	case VIRTIO_MMIO_CONFIG_GENERATION:		//0x0fc
+	case VIRTIO_MMIO_CONFIG_GENERATION:
 		pr_debug("\tVIRTIO_MMIO_CONFIG_GENERATION\n");
 		break;
 	default:
 		if (neg_flag >= VIRTIO_MMIO_CONFIG)
 			pr_debug("\tVIRTIO_MMIO_CONFIG\n");
 		else
-			pr_debug("\tNegotiation flag Unknown: %lld\n", neg_flag);
+			pr_debug("\tNegotiation flag Unknown: %lld\n",
+				 neg_flag);
 		return;
 	}
 }
@@ -171,13 +185,15 @@ static void print_neg_flag(uint64_t neg_flag, bool read)
  */
 
 /* function declaration */
-static uint64_t read_adapter(uint64_t fn_id, uint64_t size, struct device_data *dev_data);
-static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size, struct device_data *dev_data);
+static uint64_t read_adapter(uint64_t fn_id, uint64_t size,
+			     struct device_data *dev_data);
+static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size,
+			  struct device_data *dev_data);
 
 /* Configuration interface */
 static u64 vl_get_features(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 	u64 features;
 
@@ -195,7 +211,7 @@ static u64 vl_get_features(struct virtio_device *vdev)
 
 static int vl_finalize_features(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	/* Give virtio_ring a chance to accept features. */
@@ -203,17 +219,19 @@ static int vl_finalize_features(struct virtio_device *vdev)
 
 	/* Make sure there are no mixed devices */
 	if (vl_dev->version == 2 &&
-		!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
-		dev_err(&vdev->dev, "New virtio-loopback devices (version 2) "
-				"must provide VIRTIO_F_VERSION_1 feature!\n");
+	    !__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
+		dev_err(&vdev->dev,
+			"New virtio-mmio devices (version 2) must provide VIRTIO_F_VERSION_1 feature!\n");
 		return -EINVAL;
 	}
 
 	write_adapter(1, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 4, data);
-	write_adapter((u32)(vdev->features >> 32), VIRTIO_MMIO_DRIVER_FEATURES, 4, data);
+	write_adapter((u32)(vdev->features >> 32), VIRTIO_MMIO_DRIVER_FEATURES,
+		      4, data);
 
 	write_adapter(0, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 4, data);
-	write_adapter((u32)vdev->features, VIRTIO_MMIO_DRIVER_FEATURES, 4, data);
+	write_adapter((u32)vdev->features, VIRTIO_MMIO_DRIVER_FEATURES,
+		      4, data);
 
 	return 0;
 }
@@ -221,7 +239,7 @@ static int vl_finalize_features(struct virtio_device *vdev)
 static void vl_get(struct virtio_device *vdev, unsigned int offset,
 				   void *buf, unsigned int len)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	u8 b;
@@ -233,7 +251,8 @@ static void vl_get(struct virtio_device *vdev, unsigned int offset,
 		int i;
 
 		for (i = 0; i < len; i++)
-			ptr[i] = read_adapter(VIRTIO_MMIO_CONFIG + offset + i, 1, data);
+			ptr[i] = read_adapter(VIRTIO_MMIO_CONFIG + offset + i,
+					      1, data);
 		return;
 	}
 
@@ -243,17 +262,22 @@ static void vl_get(struct virtio_device *vdev, unsigned int offset,
 		memcpy(buf, &b, sizeof(b));
 		break;
 	case 2:
-		w = cpu_to_le16(read_adapter(VIRTIO_MMIO_CONFIG + offset, 2, data));
+		w = cpu_to_le16(read_adapter(VIRTIO_MMIO_CONFIG + offset,
+					     2, data));
 		memcpy(buf, &w, sizeof(w));
 		break;
 	case 4:
-		l = cpu_to_le32(read_adapter(VIRTIO_MMIO_CONFIG + offset, 4, data));
+		l = cpu_to_le32(read_adapter(VIRTIO_MMIO_CONFIG + offset,
+					     4, data));
 		memcpy(buf, &l, sizeof(l));
 		break;
 	case 8:
-		l = cpu_to_le32(read_adapter(VIRTIO_MMIO_CONFIG + offset, 4, data));
+		l = cpu_to_le32(read_adapter(VIRTIO_MMIO_CONFIG + offset,
+					     4, data));
 		memcpy(buf, &l, sizeof(l));
-		l = cpu_to_le32(read_adapter(VIRTIO_MMIO_CONFIG + offset + sizeof(l), 4, data));
+		l = cpu_to_le32(read_adapter(
+					VIRTIO_MMIO_CONFIG + offset + sizeof(l),
+					4, data));
 		memcpy(buf + sizeof(l), &l, sizeof(l));
 		break;
 	default:
@@ -264,7 +288,7 @@ static void vl_get(struct virtio_device *vdev, unsigned int offset,
 static void vl_set(struct virtio_device *vdev, unsigned int offset,
 					const void *buf, unsigned int len)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	u8 b;
@@ -276,7 +300,8 @@ static void vl_set(struct virtio_device *vdev, unsigned int offset,
 		int i;
 
 		for (i = 0; i < len; i++)
-			write_adapter(ptr[i], VIRTIO_MMIO_CONFIG + offset + i, 1, data);
+			write_adapter(ptr[i], VIRTIO_MMIO_CONFIG + offset + i,
+				      1, data);
 
 		return;
 	}
@@ -288,17 +313,22 @@ static void vl_set(struct virtio_device *vdev, unsigned int offset,
 		break;
 	case 2:
 		memcpy(&w, buf, sizeof(w));
-		write_adapter(le16_to_cpu(w), VIRTIO_MMIO_CONFIG + offset, 2, data);
+		write_adapter(le16_to_cpu(w), VIRTIO_MMIO_CONFIG + offset,
+			      2, data);
 		break;
 	case 4:
 		memcpy(&l, buf, sizeof(l));
-		write_adapter(le32_to_cpu(l), VIRTIO_MMIO_CONFIG + offset, 4, data);
+		write_adapter(le32_to_cpu(l), VIRTIO_MMIO_CONFIG + offset,
+			      4, data);
 		break;
 	case 8:
 		memcpy(&l, buf, sizeof(l));
-		write_adapter(le32_to_cpu(l), VIRTIO_MMIO_CONFIG + offset, 4, data);
+		write_adapter(le32_to_cpu(l), VIRTIO_MMIO_CONFIG + offset,
+			      4, data);
 		memcpy(&l, buf + sizeof(l), sizeof(l));
-		write_adapter(le32_to_cpu(l), VIRTIO_MMIO_CONFIG + offset + sizeof(l), 4, data);
+		write_adapter(le32_to_cpu(l),
+			      VIRTIO_MMIO_CONFIG + offset + sizeof(l),
+			      4, data);
 		break;
 	default:
 		BUG();
@@ -307,7 +337,7 @@ static void vl_set(struct virtio_device *vdev, unsigned int offset,
 
 static u32 vl_generation(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	if (vl_dev->version == 1)
@@ -318,7 +348,7 @@ static u32 vl_generation(struct virtio_device *vdev)
 
 static u8 vl_get_status(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	return read_adapter(VIRTIO_MMIO_STATUS, 4, data) & 0xff;
@@ -326,7 +356,7 @@ static u8 vl_get_status(struct virtio_device *vdev)
 
 static void vl_set_status(struct virtio_device *vdev, u8 status)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	write_adapter(status, VIRTIO_MMIO_STATUS, 4, data);
@@ -334,7 +364,7 @@ static void vl_set_status(struct virtio_device *vdev, u8 status)
 
 static void vl_reset(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 
 	/* 0 status means a reset. */
@@ -344,7 +374,8 @@ static void vl_reset(struct virtio_device *vdev)
 /* Notify work handling function */
 static void notify_work_handler(struct work_struct *work)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(work, notify_work);
+	struct virtio_loopback_device *vl_dev =
+		container_of(work, struct virtio_loopback_device, notify_work);
 	struct device_data *dev_data = vl_dev->data;
 	struct notify_data *entry, *tmp;
 	uint32_t index;
@@ -365,30 +396,46 @@ static void notify_work_handler(struct work_struct *work)
 /* The notify function used when creating a virtqueue */
 static bool vl_notify(struct virtqueue *vq)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vq->vdev, vdev);
+	struct virtio_loopback_device *vl_dev =
+		to_virtio_loopback_device(vq->vdev);
+	struct eventfd_ctx **vq_notifiers = vl_dev->data->vq_data.vq_notifiers;
+	bool vq_notifiers_enabled = vl_dev->data->vq_data.vq_notifiers_enabled;
 	struct notify_data *data;
 	int ret = 1;
 
-	/* Create the new node */
-	data = kmalloc(sizeof(struct notify_data), GFP_ATOMIC);
-	if (!data)
-		return false;
+	if (vq_notifiers_enabled && (vq_notifiers[vq->index])) {
+		/* Notify directly vhost-user-device bypassing the adapter */
+#if LINUX_VERSION_CODE > KERNEL_VERSION(6, 7, 12)
+		eventfd_signal(vq_notifiers[vq->index]);
+#else
+		eventfd_signal(vq_notifiers[vq->index], 1);
+#endif
+	} else {
+		/* Create the new node */
+		data = kmalloc(sizeof(struct notify_data), GFP_ATOMIC);
+		if (!data)
+			return false;
 
-	data->index = vq->index;
-	INIT_LIST_HEAD(&data->list);
+		data->index = vq->index;
+		INIT_LIST_HEAD(&data->list);
 
-	/* Add in the notify_list, which should be protected! */
-	spin_lock(&vl_dev->notify_q_lock);
-	list_add_tail(&data->list, &vl_dev->notify_list);
-	spin_unlock(&vl_dev->notify_q_lock);
-
-	/* Schedule the element */
-	while (ret) {
-		/* Force scheduling if queue_work fails and list is not empty */
-		ret = !queue_work(loopback_data.notify_workqueue, &vl_dev->notify_work);
+		/* Add in the notify_list, which should be protected! */
 		spin_lock(&vl_dev->notify_q_lock);
-		ret &= !list_empty(&vl_dev->notify_list);
+		list_add_tail(&data->list, &vl_dev->notify_list);
 		spin_unlock(&vl_dev->notify_q_lock);
+
+		/* Schedule the element */
+		while (ret) {
+			/*
+			 * Force scheduling if queue_work fails and
+			 * list is not empty
+			 */
+			ret = !queue_work(vl_dev->notify_workqueue,
+					  &vl_dev->notify_work);
+			spin_lock(&vl_dev->notify_q_lock);
+			ret &= !list_empty(&vl_dev->notify_list);
+			spin_unlock(&vl_dev->notify_q_lock);
+		}
 	}
 
 	return true;
@@ -401,9 +448,12 @@ bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq)
 	struct virtio_loopback_vq_info *info;
 	unsigned long status;
 
-	pr_debug("Received interrupt!\n");
-	/* STATUS and ACK should be done without any intermediate status change */
-	/* Read and acknowledge interrupts */
+	/*
+	 * Read and acknowledge interrupts
+	 *
+	 * Those two operations should be executed without any
+	 * intermediate status change.
+	 */
 	status = read_adapter(VIRTIO_MMIO_INTERRUPT_STATUS, 4, data);
 	write_adapter(status, VIRTIO_MMIO_INTERRUPT_ACK, 4, data);
 
@@ -423,7 +473,8 @@ bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq)
 
 static void vl_del_vq(struct virtqueue *vq)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vq->vdev, vdev);
+	struct virtio_loopback_device *vl_dev =
+		to_virtio_loopback_device(vq->vdev);
 	struct device_data *data = vl_dev->data;
 
 	struct virtio_loopback_vq_info *info = vq->priv;
@@ -456,11 +507,12 @@ static void vl_del_vqs(struct virtio_device *vdev)
 		vl_del_vq(vq);
 }
 
-static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int index,
-				  void (*callback)(struct virtqueue *vq),
-				  const char *name, bool ctx)
+static struct virtqueue *vl_setup_vq(struct virtio_device *vdev,
+				     unsigned int index,
+				     void (*callback)(struct virtqueue *vq),
+				     const char *name, bool ctx)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 	struct virtio_loopback_vq_info *info;
 	struct virtqueue *vq;
@@ -476,7 +528,8 @@ static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int in
 
 	/* Queue shouldn't already be set up. */
 	if (read_adapter((vl_dev->version == 1 ?
-			VIRTIO_MMIO_QUEUE_PFN : VIRTIO_MMIO_QUEUE_READY), 4, data)) {
+			 VIRTIO_MMIO_QUEUE_PFN : VIRTIO_MMIO_QUEUE_READY),
+			 4, data)) {
 		err = -ENOENT;
 		goto error_available;
 	}
@@ -496,7 +549,7 @@ static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int in
 
 	/* Create the vring */
 	vq = vring_create_virtqueue(index, num, VIRTIO_MMIO_VRING_ALIGN, vdev,
-					 true, true, ctx, vl_notify, callback, name);
+				    true, true, ctx, vl_notify, callback, name);
 	if (!vq) {
 		err = -ENOMEM;
 		goto error_new_virtqueue;
@@ -507,7 +560,8 @@ static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int in
 #endif
 
 	/* Activate the queue */
-	write_adapter(virtqueue_get_vring_size(vq), VIRTIO_MMIO_QUEUE_NUM, 4, data);
+	write_adapter(virtqueue_get_vring_size(vq), VIRTIO_MMIO_QUEUE_NUM, 4,
+		      data);
 	if (vl_dev->version == 1) {
 		u64 q_pfn = virtqueue_get_desc_addr(vq);
 
@@ -518,14 +572,13 @@ static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int in
 		data->vq_data.vq_pfns[data->vq_data.vq_index++] = q_pfn;
 
 		/*
-		 * virtio-loopback v1 uses a 32bit QUEUE PFN. If we have something
-		 * that doesn't fit in 32bit, fail the setup rather than
-		 * pretending to be successful.
+		 * virtio-loopback v1 uses a 32bit QUEUE PFN. If we have
+		 * something that doesn't fit in 32bit, fail the setup rather
+		 * than pretending to be successful.
 		 */
 		if (q_pfn >> 32) {
 			dev_err(&vdev->dev,
-				"platform bug: legacy virtio-loopback must not "
-				"be used with RAM above 0x%llxGB\n",
+				"platform bug: legacy virtio-loopback must not be used with RAM above 0x%llxGB\n",
 				0x1ULL << (32 + PAGE_SHIFT - 30));
 			err = -E2BIG;
 			goto error_bad_pfn;
@@ -538,15 +591,18 @@ static struct virtqueue *vl_setup_vq(struct virtio_device *vdev, unsigned int in
 
 		addr = virtqueue_get_desc_addr(vq);
 		write_adapter((u32)addr, VIRTIO_MMIO_QUEUE_DESC_LOW, 4, data);
-		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_DESC_HIGH, 4, data);
+		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_DESC_HIGH,
+			      4, data);
 
 		addr = virtqueue_get_avail_addr(vq);
 		write_adapter((u32)addr, VIRTIO_MMIO_QUEUE_AVAIL_LOW, 4, data);
-		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_AVAIL_HIGH, 4, data);
+		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
+			      4, data);
 
 		addr = virtqueue_get_used_addr(vq);
 		write_adapter((u32)addr, VIRTIO_MMIO_QUEUE_USED_LOW, 4, data);
-		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_USED_HIGH, 4, data);
+		write_adapter((u32)(addr >> 32), VIRTIO_MMIO_QUEUE_USED_HIGH,
+			      4, data);
 
 		write_adapter(1, VIRTIO_MMIO_QUEUE_READY, 4, data);
 	}
@@ -618,7 +674,7 @@ static int vl_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 		}
 
 		vqs[i] = vl_setup_vq(vdev, queue_idx++, vqi->callback,
-					 vqi->name, vqi->ctx);
+				     vqi->name, vqi->ctx);
 		if (IS_ERR(vqs[i])) {
 			vl_del_vqs(vdev);
 			return PTR_ERR(vqs[i]);
@@ -631,15 +687,15 @@ static int vl_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 
 static const char *vl_bus_name(struct virtio_device *vdev)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 
 	return vl_dev->pdev->name;
 }
 
 static bool vl_get_shm_region(struct virtio_device *vdev,
-				  struct virtio_shm_region *region, u8 id)
+			      struct virtio_shm_region *region, u8 id)
 {
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct device_data *data = vl_dev->data;
 	u64 len, addr;
 
@@ -668,24 +724,25 @@ static bool vl_get_shm_region(struct virtio_device *vdev,
 }
 
 static const struct virtio_config_ops virtio_loopback_config_ops = {
-	.get				= vl_get,
-	.set				= vl_set,
-	.generation			= vl_generation,
-	.get_status			= vl_get_status,
-	.set_status			= vl_set_status,
-	.reset				= vl_reset,
-	.find_vqs			= vl_find_vqs,
-	.del_vqs			= vl_del_vqs,
+	.get			= vl_get,
+	.set			= vl_set,
+	.generation		= vl_generation,
+	.get_status		= vl_get_status,
+	.set_status		= vl_set_status,
+	.reset			= vl_reset,
+	.find_vqs		= vl_find_vqs,
+	.del_vqs		= vl_del_vqs,
 	.get_features		= vl_get_features,
 	.finalize_features	= vl_finalize_features,
-	.bus_name			= vl_bus_name,
+	.bus_name		= vl_bus_name,
 	.get_shm_region		= vl_get_shm_region,
 };
 
 static void virtio_loopback_release_dev(struct device *_d)
 {
-	struct virtio_device *vdev = container_of(_d, struct virtio_device, dev);
-	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev, vdev);
+	struct virtio_device *vdev =
+		container_of(_d, struct virtio_device, dev);
+	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct platform_device *pdev = vl_dev->pdev;
 
 	devm_kfree(&pdev->dev, vl_dev);
@@ -745,8 +802,8 @@ int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev)
 	if (rc)
 		rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (rc)
-		dev_warn(&pdev->dev, "Failed to enable 64-bit or 32-bit DMA."
-				"Trying to continue, but this might not work.\n");
+		dev_warn(&pdev->dev,
+			 "Failed to enable 64-bit or 32-bit DMA. Trying to continue, but this might not work.\n");
 
 	/* Register the virtio device in the system */
 	rc = register_virtio_device(&vl_dev->vdev);
@@ -775,6 +832,8 @@ static int virtio_loopback_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&vl_dev->virtqueues);
 	spin_lock_init(&vl_dev->lock);
 	/* Initialize the workqueue */
+	vl_dev->notify_workqueue =
+		create_singlethread_workqueue("notify_workqueue");
 	INIT_WORK(&vl_dev->notify_work, notify_work_handler);
 	INIT_LIST_HEAD(&vl_dev->notify_list);
 	spin_lock_init(&vl_dev->notify_q_lock);
@@ -795,6 +854,10 @@ int virtio_loopback_remove(struct platform_device *pdev)
 #endif
 {
 	struct virtio_loopback_device *vl_dev = platform_get_drvdata(pdev);
+
+	/* Destroy the notify workqueue */
+	flush_workqueue(vl_dev->notify_workqueue);
+	destroy_workqueue(vl_dev->notify_workqueue);
 
 	if (vl_dev->data) {
 		unregister_virtio_device(&vl_dev->vdev);
@@ -817,7 +880,8 @@ struct platform_driver virtio_loopback_driver = {
 	},
 };
 
-static uint64_t read_adapter(uint64_t fn_id, uint64_t size, struct device_data *dev_data)
+static uint64_t read_adapter(uint64_t fn_id, uint64_t size,
+			     struct device_data *dev_data)
 {
 	uint64_t result;
 
@@ -852,8 +916,11 @@ static uint64_t read_adapter(uint64_t fn_id, uint64_t size, struct device_data *
 	 * "wake_up" kick, check the updated "done" value and return.
 	 */
 
-	while (dev_data->valid_eventfd && atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
-		wait_event_timeout(dev_data->wq, atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1, 1 * HZ);
+	while (dev_data->valid_eventfd &&
+	       atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
+		wait_event_timeout(dev_data->wq,
+			atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1,
+			1 * HZ);
 
 	result = ((struct virtio_neg *)(dev_data->info->data))->data;
 
@@ -862,7 +929,8 @@ static uint64_t read_adapter(uint64_t fn_id, uint64_t size, struct device_data *
 	return result;
 }
 
-static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size, struct device_data *dev_data)
+static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size,
+			  struct device_data *dev_data)
 {
 
 	mutex_lock(&(dev_data)->read_write_lock);
@@ -895,8 +963,11 @@ static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size, struct d
 	 * way, virtio-loopback driver will wake up even if has missed the
 	 * "wake_up" kick, check the updated "done" value and return.
 	 */
-	while (dev_data->valid_eventfd && atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
-		wait_event_timeout(dev_data->wq, atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1, 1 * HZ);
+	while (dev_data->valid_eventfd &&
+	       atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
+		wait_event_timeout(dev_data->wq,
+			atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1,
+			1 * HZ);
 
 	mutex_unlock(&(dev_data)->read_write_lock);
 }

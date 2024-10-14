@@ -1,6 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * Virtio loopback device driver
+ *
  * Copyright 2022-2024 Virtual Open Systems SAS.
+ *
+ * Authors:
+ *  Timos Ampelikiotis <t.ampelikiotis@virtualopensystems.com>
+ *  Anna Panagopoulou <anna@virtualopensystems.com>
+ *  Alvise Rigo <a.rigo@virtualopensystems.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -11,11 +18,8 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  */
+
 #ifndef __LOOPBACK_H__
 #define __LOOPBACK_H__
 
@@ -45,7 +49,7 @@
 #include <linux/spinlock.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
-#include <uapi/linux/virtio_mmio.h>
+#include <linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
 
 #include <linux/kernel.h>
@@ -55,7 +59,6 @@
 #include <linux/kthread.h>
 
 /* mmap includes */
-#include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
@@ -77,8 +80,8 @@
  */
 #define VIRTIO_MMIO_VRING_ALIGN PAGE_SIZE
 
-#define to_virtio_loopback_device(ptr, field) \
-	container_of(ptr, struct virtio_loopback_device, field)
+#define to_virtio_loopback_device(ptr) \
+	container_of(ptr, struct virtio_loopback_device, vdev)
 
 /* mmap functionality */
 #ifndef VM_RESERVED
@@ -91,7 +94,8 @@
 #define START_LOOPBACK _IOC(_IOC_WRITE, 'k', 3, sizeof(struct virtio_device_info_struct))
 #define IRQ _IOC(_IOC_WRITE, 'k', 4, sizeof(int))
 #define SHARE_VQS _IOC(_IOC_WRITE, 'k', 5, sizeof(uint32_t))
-#define SHARE_COM_STRUCT _IOC(_IOC_WRITE, 'k', 7, 0)
+#define SHARE_COM_STRUCT _IOC(_IOC_WRITE, 'k', 6, 0)
+#define SHARE_VQS_NOTIF _IOC(_IOC_WRITE, 'k', 7, sizeof(struct vq_notifier))
 
 /* Data structures */
 struct virtio_device_info_struct {
@@ -126,11 +130,19 @@ struct mmap_data {
 	uint64_t sum_pgfaults;
 };
 
+struct vq_notifier {
+	uint32_t vq_index;
+	int notifier_fd;
+	int pid;
+};
+
 /* vq related data */
 struct vq_data {
 	uint32_t vq_index;
 	uint64_t vq_pfns[16];
 	uint64_t vq_pfn;
+	struct eventfd_ctx *vq_notifiers[16];
+	bool vq_notifiers_enabled;
 };
 
 /* Data describing each device private status */
@@ -190,6 +202,9 @@ struct virtio_loopback_device {
 	spinlock_t lock;
 	struct list_head virtqueues;
 
+	/* Define workqueue for notifications */
+	struct workqueue_struct *notify_workqueue;
+
 	/* Notify list and work struct */
 	spinlock_t notify_q_lock;
 	struct list_head notify_list;
@@ -231,23 +246,14 @@ struct loopback_device_data {
 	/* sysfs class structure */
 	struct class *class;
 	struct cdev cdev;
-	/* Define workqueue for notifications */
-	struct workqueue_struct *notify_workqueue;
 };
 
 /* Global variables */
-extern struct loopback_device_data loopback_data;
-extern struct loopback_devices_array loopback_devices;
 extern struct platform_driver virtio_loopback_driver;
 
 /* Global functions */
 int insert_entry_data(struct virtio_loopback_device *vl_dev, int id);
 int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev);
 bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq);
-#if LINUX_VERSION_CODE > KERNEL_VERSION(6, 10, 8)
-void virtio_loopback_remove(struct platform_device *pdev);
-#else
-int virtio_loopback_remove(struct platform_device *pdev);
-#endif
 
 #endif /* __LOOPBACK_H__ */

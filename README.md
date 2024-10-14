@@ -1,8 +1,8 @@
 # virtio-loopback transport repository
 
-This repository includes the latest version of the "virtio_loopback_transport" driver which is part of the Virtio Loopback Design presented in this [document](https://git.virtualopensystems.com/virtio-loopback/docs/-/blob/master/design_docs). This work carried on by Virtual Open Systems in the [Automotive Grade Linux](https://www.automotivegradelinux.org) community.
+This repository includes the "virtio-loopback" driver which is part of the Virtio-loopback design. If you want to learn more about how to set up and test the whole virtio-loopback architecture, refer to the [virtio-loopback testing guide](https://gerrit.automotivelinux.org/gerrit/gitweb?p=src/virtio/virtio-loopback-adapter.git;a=blob;f=Documentation/testing_virtio_loopback_design.md;hb=HEAD).
 
-As described in the design document, the transport is only a part of a more complex architecture. If you want to see the implementation and build the other components, refer to the [virtio-loopback docs repository](https://git.virtualopensystems.com/virtio-loopback/docs/-/tree/epsilon-release).
+This work carried on by Virtual Open Systems in the [Automotive Grade Linux](https://www.automotivegradelinux.org) community.
 
 ## Build the virtio-loopback transport
 
