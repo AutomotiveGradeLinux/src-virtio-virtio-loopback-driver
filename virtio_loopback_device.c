@@ -149,41 +149,6 @@ static void print_neg_flag(uint64_t neg_flag, bool read)
 	}
 }
 
-/*
- * Print the pdev:
- *
- *static void print_virtio_pdev(struct platform_device *pdev)
- *{
- *	int i;
- *
- *	pr_info("Print the pdev:\n");
- *	pr_info("\t.name = %s\n", pdev->name);
- *	pr_info("\t.id = %d\n", pdev->id);
- *	pr_info("\t.num_resources = %d\n", pdev->num_resources);
- *
- *	for (i=0; i < pdev->num_resources; i++) {
- *		pr_info("\t.num_resource = %d\n", i);
- *		pr_info("\t\t.start = 0x%llx\n", pdev->resource[i].start);
- *		pr_info("\t\t.end = 0x%llx\n", pdev->resource[i].end);
- *		pr_info("\t\t.flags = 0x%lx\n", pdev->resource[i].flags);
- *	}
- *}
- *
- *Result:
- *
- *	.name = a003e00.virtio_loopback
- *	.id = -1
- *	.num_resources = 2
- *	.num_resource = 0
- *		.start = 0xa003e00
- *		.end = 0xa003fff
- *		.flags = 0x200
- *	.num_resource = 1
- *		.start = 0x2c
- *		.end = 0x2c
- *		.flags = 0x401
- */
-
 /* function declaration */
 static uint64_t read_adapter(uint64_t fn_id, uint64_t size,
 			     struct device_data *dev_data);
@@ -393,15 +358,13 @@ static void notify_work_handler(struct work_struct *work)
 	spin_unlock(&vl_dev->notify_q_lock);
 }
 
-/* The notify function used when creating a virtqueue */
-static bool vl_notify(struct virtqueue *vq)
+static bool trigger_notification(struct virtqueue *vq)
 {
 	struct virtio_loopback_device *vl_dev =
 		to_virtio_loopback_device(vq->vdev);
 	struct eventfd_ctx **vq_notifiers = vl_dev->data->vq_data.vq_notifiers;
 	bool vq_notifiers_enabled = vl_dev->data->vq_data.vq_notifiers_enabled;
-	struct notify_data *data;
-	int ret = 1;
+	int ret;
 
 	if (vq_notifiers_enabled && (vq_notifiers[vq->index])) {
 		/* Notify directly vhost-user-device bypassing the adapter */
@@ -411,19 +374,6 @@ static bool vl_notify(struct virtqueue *vq)
 		eventfd_signal(vq_notifiers[vq->index], 1);
 #endif
 	} else {
-		/* Create the new node */
-		data = kmalloc(sizeof(struct notify_data), GFP_ATOMIC);
-		if (!data)
-			return false;
-
-		data->index = vq->index;
-		INIT_LIST_HEAD(&data->list);
-
-		/* Add in the notify_list, which should be protected! */
-		spin_lock(&vl_dev->notify_q_lock);
-		list_add_tail(&data->list, &vl_dev->notify_list);
-		spin_unlock(&vl_dev->notify_q_lock);
-
 		/* Schedule the element */
 		while (ret) {
 			/*
@@ -441,35 +391,563 @@ static bool vl_notify(struct virtqueue *vq)
 	return true;
 }
 
-/* the interrupt function used when receiving an IRQ */
-bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq)
+/* Notify work handling function */
+static void trigger_dev_notif(struct virtio_loopback_device *vl_dev)
 {
-	struct device_data *data = vl_dev->data;
+	struct notify_data *entry, *tmp;
+	uint32_t index;
 	struct virtio_loopback_vq_info *info;
-	unsigned long status;
 
-	/*
-	 * Read and acknowledge interrupts
-	 *
-	 * Those two operations should be executed without any
-	 * intermediate status change.
-	 */
-	status = read_adapter(VIRTIO_MMIO_INTERRUPT_STATUS, 4, data);
-	write_adapter(status, VIRTIO_MMIO_INTERRUPT_ACK, 4, data);
+	if (atomic_read(&vl_dev->data->avail_notifs) == 0)
+		return;
 
-	if (unlikely(status & VIRTIO_MMIO_INT_CONFIG))
-		virtio_config_changed(&vl_dev->vdev);
+	spin_lock(&vl_dev->notify_q_lock);
+	list_for_each_entry_safe(entry, tmp, &vl_dev->notify_list, list) {
+		index = entry->index;
+		list_del(&entry->list);
+		kfree(entry);
+		spin_unlock(&vl_dev->notify_q_lock);
 
-	if (likely(status & VIRTIO_MMIO_INT_VRING)) {
-		spin_lock(&vl_dev->lock);
+		/* Decrease atomically the notification counters */
+		atomic_dec(&vl_dev->data->avail_notifs);
+		atomic_dec(&loopback_devices.pending_notifs);
+
+		/* Find which is the corresponing vq and trigger the notification */
 		list_for_each_entry(info, &vl_dev->virtqueues, node) {
-			(void)vring_interrupt(irq, info->vq);
+			if (info->vq->index == index) {
+				(void)trigger_notification(info->vq);
+				/* Decrease the notification handlers */
+				return;
+			}
 		}
-		spin_unlock(&vl_dev->lock);
+		spin_lock(&vl_dev->notify_q_lock);
 	}
+	spin_unlock(&vl_dev->notify_q_lock);
+}
+
+static bool available_notifications(void)
+{
+	return atomic_read(&loopback_devices.pending_notifs) > 0;
+}
+
+static void set_dev_credits(struct virtio_loopback_device *vl_dev, int64_t remaining_credits)
+{
+	if (remaining_credits > 0) {
+		if (remaining_credits > vl_dev->data->vdev_data->init_notif_credits)
+			atomic_set(&vl_dev->data->notif_credits, vl_dev->data->vdev_data->init_notif_credits);
+		else
+			atomic_set(&vl_dev->data->notif_credits, (uint32_t)remaining_credits);
+	} else {
+		atomic_set(&vl_dev->data->notif_credits, 0);
+	}
+}
+
+static void reset_credits(struct virtio_loopback_device *vl_dev)
+{
+	/* Update timestamp & available credits */
+	vl_dev->data->served_timestamp = ktime_get();
+	set_dev_credits(vl_dev, vl_dev->data->vdev_data->init_notif_credits);
+}
+
+static uint32_t read_dev_credits(struct virtio_loopback_device *vl_dev)
+{
+	return atomic_read(&vl_dev->data->notif_credits);
+}
+
+static uint32_t read_dev_notifs(struct virtio_loopback_device *vl_dev)
+{
+	return atomic_read(&vl_dev->data->avail_notifs);
+}
+
+static struct virtio_loopback_device_node *head_elem(void)
+{
+	struct virtio_loopback_device_node *device;
+
+	spin_lock(&loopback_devices.running_lock);
+	device = list_first_entry_or_null(
+			&loopback_devices.virtio_devices_list,
+			struct virtio_loopback_device_node,
+			node);
+	spin_unlock(&loopback_devices.running_lock);
+	return device;
+}
+
+static struct virtio_loopback_device_node *
+ next_elem(struct virtio_loopback_device_node *device)
+{
+	int ret;
+
+	device = list_next_entry(device, node);
+
+	/* If reached the list head, wrap around to the beginning */
+	spin_lock(&loopback_devices.running_lock);
+	ret = list_entry_is_head(device, &loopback_devices.virtio_devices_list, node);
+	spin_unlock(&loopback_devices.running_lock);
+
+	if (ret)
+		device = head_elem();
+
+	return device;
+}
+
+bool add_dev_to_list(uint32_t array_dev_pos)
+{
+	struct virtio_loopback_device_node *dev_node;
+
+	/* Add this device to a global list */
+	dev_node = kmalloc(sizeof(struct virtio_loopback_device_node), GFP_ATOMIC);
+	if (!dev_node)
+		return false;
+
+	/* TODO: Check the next line */
+	dev_node->vq_index = array_dev_pos;
+	INIT_LIST_HEAD(&dev_node->node);
+	atomic_set(&dev_node->is_deleted, 0);
+
+	spin_lock(&loopback_devices.running_lock);
+	list_add_tail(&dev_node->node, &loopback_devices.virtio_devices_list);
+	spin_unlock(&loopback_devices.running_lock);
 
 	return true;
 }
+
+static bool is_dev_deleted(struct virtio_loopback_device_node *device)
+{
+	return atomic_read(&device->is_deleted) == 1;
+}
+
+static void del_dev_from_list(struct virtio_loopback_device_node *device)
+{
+	spin_lock(&loopback_devices.running_lock);
+	list_del(&device->node);
+	spin_unlock(&loopback_devices.running_lock);
+	kfree(device);
+}
+
+/*
+ * void clean_dev_notifs_inters(struct virtio_loopback_device_node *device)
+ * {
+ * 	struct notify_data *entry, *tmp;
+ * 	struct virtio_loopback_device *vl_dev = loopback_devices.devices[device->vq_index];
+ * 	int i, avail_inters = atomic_read(&vl_dev->data->avail_inters);
+ *
+ * 	spin_lock(&vl_dev->notify_q_lock);
+ * 	list_for_each_entry_safe(entry, tmp, &vl_dev->notify_list, list) {
+ * 		atomic_dec(&vl_dev->data->avail_notifs);
+ * 		atomic_dec(&loopback_devices.pending_notifs);
+ * 	}
+ * 	spin_unlock(&vl_dev->notify_q_lock);
+ *
+ * 	for (i = 0; i < avail_inters; i++) {
+ * 		atomic_dec(&vl_dev->data->avail_inters);
+ * 		atomic_dec(&loopback_devices.pending_inters);
+ * 	}
+ * }
+ */
+
+void note_dev_deletion(struct virtio_loopback_device *vl_dev)
+{
+	struct virtio_loopback_device_node *device, *temp = NULL;
+
+	spin_lock(&loopback_devices.running_lock);
+	list_for_each_entry(device, &loopback_devices.virtio_devices_list, node) {
+		if (vl_dev == loopback_devices.devices[device->vq_index]) {
+			temp = device;
+			break;
+		}
+	}
+	spin_unlock(&loopback_devices.running_lock);
+
+	if (temp)
+		atomic_set(&device->is_deleted, 1);
+}
+
+/*
+ * void clean_deleted_devs(void)
+ * {
+ * 	struct virtio_loopback_device_node *temp = NULL;
+ *
+ * 	spin_lock(&loopback_devices.running_lock);
+ * 	list_for_each_entry_safe(device, temp, &loopback_devices.virtio_devices_list, node) {
+ * 		if (is_dev_deleted(device)) {
+ * 			list_del(&device->node);
+ * 			kfree(device);
+ * 		}
+ * 	}
+ * 	spin_unlock(&loopback_devices.running_lock);
+ * }
+ */
+
+static void clean_all_devs(void)
+{
+	struct virtio_loopback_device_node *device = NULL, *temp = NULL;
+
+	spin_lock(&loopback_devices.running_lock);
+	list_for_each_entry_safe(device, temp, &loopback_devices.virtio_devices_list, node) {
+		list_del(&device->node);
+		kfree(device);
+	}
+	spin_unlock(&loopback_devices.running_lock);
+}
+
+/*
+ * static bool is_node_in_list(struct virtio_loopback_device_node *device)
+ * {
+ * 	struct virtio_loopback_device_node *temp;
+ * 	bool ret = false;
+ *
+ * 	rcu_read_lock();
+ * 	list_for_each_entry_rcu(temp, &loopback_devices.virtio_devices_list, node) {
+ * 		if (temp == device) {
+ * 			ret = true;
+ * 			break;
+ * 		}
+ * 	}
+ * 	rcu_read_unlock();
+ *
+ * 	return ret;
+ * }
+ */
+
+static bool available_interrupts(void)
+{
+	return atomic_read(&loopback_devices.pending_inters) > 0;
+}
+
+static uint32_t read_dev_inters(struct virtio_loopback_device *vl_dev)
+{
+	return atomic_read(&vl_dev->data->avail_inters);
+}
+
+static uint32_t highest_active_priority_notifs(void)
+{
+	struct virtio_loopback_device_node *device;
+	struct virtio_loopback_device *vl_dev;
+	uint32_t max_priority = 0;
+
+	spin_lock(&loopback_devices.running_lock);
+	list_for_each_entry(device, &loopback_devices.virtio_devices_list, node) {
+		if (is_dev_deleted(device))
+			continue;
+		vl_dev = loopback_devices.devices[device->vq_index];
+		if ((read_dev_notifs(vl_dev) > 0) || (read_dev_inters(vl_dev) > 0))
+			if (vl_dev->data->priority_group > max_priority)
+				max_priority = vl_dev->data->priority_group;
+	}
+	spin_unlock(&loopback_devices.running_lock);
+
+	return max_priority;
+}
+
+static void update_highest_active_prior_notifs(void)
+{
+	uint32_t current_highest_priority = highest_active_priority_notifs();
+
+	atomic_set(&loopback_devices.highest_active_prior_notifs, current_highest_priority);
+}
+
+static bool dev_highest_prior_notifs(struct virtio_loopback_device *vl_dev)
+{
+	return vl_dev->data->priority_group >=
+		atomic_read(&loopback_devices.highest_active_prior_notifs);
+}
+
+static uint64_t read_dev_served_timestamp(struct virtio_loopback_device *vl_dev)
+{
+	return vl_dev->data->served_timestamp;
+}
+
+static bool oldest_active_dev_in_group(struct virtio_loopback_device *curr_vl_dev)
+{
+	struct virtio_loopback_device_node *device;
+	struct virtio_loopback_device *vl_dev;
+	uint64_t oldest_active_dev_time = (uint64_t)ktime_get();
+
+	spin_lock(&loopback_devices.running_lock);
+	list_for_each_entry(device, &loopback_devices.virtio_devices_list, node) {
+		if (is_dev_deleted(device))
+			continue;
+		vl_dev = loopback_devices.devices[device->vq_index];
+		/* Iterate only on active devices */
+		if ((read_dev_notifs(vl_dev) > 0) || (read_dev_inters(vl_dev) > 0))
+			/* Iterate only on active devices the same group */
+			if ((vl_dev->data->priority_group == curr_vl_dev->data->priority_group) &&
+				(read_dev_served_timestamp(vl_dev) < oldest_active_dev_time))
+				/* Save the oldest timestamp of a device aligned with above critirias */
+				oldest_active_dev_time = read_dev_served_timestamp(vl_dev);
+	}
+	spin_unlock(&loopback_devices.running_lock);
+
+	return oldest_active_dev_time == read_dev_served_timestamp(curr_vl_dev);
+}
+
+/* the interrupt function used when receiving an IRQ */
+static bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq)
+{
+	struct virtio_loopback_vq_info *info;
+
+	spin_lock(&vl_dev->lock);
+	list_for_each_entry(info, &vl_dev->virtqueues, node) {
+		(void)vring_interrupt(irq, info->vq);
+	}
+	spin_unlock(&vl_dev->lock);
+
+	return true;
+}
+
+/*
+ * Pseudo algorith: with groups (implementation 1)
+ *
+ * For dev in dev_list
+ *
+ *     if dev->priority != active_list_highest_prior or
+ *        dev_idle or
+ *        dev_older_in_group()
+ *         go next
+ *
+ *     while(time(dev_credits) {
+ *             trigger_notifications
+ *     }
+ *
+ *    update_highest_priority()
+ *
+ */
+
+/*
+ * Pseudo algorith: with groups (implementation 2)
+ *
+ * idle_list_dev = dev_1, dev_2, ... , dev_n
+ * active_list_dev = null
+ * active_list_highest_prior = 'A'
+ *
+ * for dev in active_list_dev
+ *
+ *     if dev->priority != active_list_highest_prior or
+ *        dev_older_in_group()
+ *         go next
+ *
+ *     while(time(cred_dev))
+ *         trigger_notifications
+ *
+ *     remove(dev, active_list_dev)
+ *     add(dev, idle_list_dev)
+ *     update_highest_priority()
+ *
+ */
+
+int notif_sched_func(void *data)
+{
+	struct virtio_loopback_device *vl_dev;
+	struct virtio_loopback_device_node *device = NULL, *temp = NULL;
+	ktime_t starting_time, deadline;
+
+	/* Wait the first notification */
+	while (!available_notifications() && !kthread_should_stop()) {
+		wait_event_timeout(
+			loopback_devices.wq_notifs_inters,
+			available_notifications() || kthread_should_stop(),
+			100 * HZ);
+	}
+
+	if (kthread_should_stop())
+		goto sched_exit;
+
+	device = head_elem();
+	if (unlikely(!device)) {
+		pr_err("Device list is empty - exit\n");
+		return 1;
+	}
+
+	while (!kthread_should_stop()) {
+		if ((available_notifications() ||
+		    available_interrupts()) &&
+		    !list_empty(&loopback_devices.virtio_devices_list)) {
+
+			if (is_dev_deleted(device)) {
+				temp = device;
+				device = next_elem(device);
+				del_dev_from_list(temp);
+				continue;
+			}
+
+			vl_dev = loopback_devices.devices[device->vq_index];
+
+			pr_debug("Available notifs: %u\n", atomic_read(&loopback_devices.pending_notifs));
+			pr_debug("Available inters: %u\n", atomic_read(&loopback_devices.pending_inters));
+			pr_debug("Device %lu avail credits: %u, avail notifications %u, avail_inters: %u\n",
+			      vl_dev->data->vdev_data->init_notif_credits,
+			      read_dev_credits(vl_dev),
+			      read_dev_inters(vl_dev),
+			      read_dev_notifs(vl_dev));
+
+			/*
+			 * We need to go to the next device if:
+			 * a) Current device does not have available notifications AND
+			 *    current device does not have available interrupts
+			 * b) There is another pending device with higher priority
+			 * c) There is another pending device in the same group
+			 *    which has not been served for longer time.
+			 */
+
+			if (((read_dev_notifs(vl_dev) == 0) &&
+			     (read_dev_inters(vl_dev) == 0)) ||
+				(!dev_highest_prior_notifs(vl_dev)) ||
+				(!oldest_active_dev_in_group(vl_dev))) {
+				device = next_elem(device);
+				continue;
+			}
+
+			pr_debug("Run Device %lu\n",
+			      vl_dev->data->vdev_data->init_notif_credits);
+
+			/*
+			 * Keep the active highest priority in a variable
+			 * and continue triggering notications only if the
+			 * devices has priority equal or bigger then the highest.
+			 * This helps to give control to the device with
+			 * highest priority immediatly without waiting the
+			 * running device to complete it turn.
+			 */
+			starting_time = ktime_get();
+			deadline = ktime_add_ms(starting_time, read_dev_credits(vl_dev));
+			while (ktime_before(starting_time, deadline) &&
+						!kthread_should_stop() &&
+						dev_highest_prior_notifs(vl_dev)) {
+				if (read_dev_notifs(vl_dev) > 0) {
+					trigger_dev_notif(vl_dev);
+				} else if (read_dev_inters(vl_dev) > 0) {
+					atomic_dec(&vl_dev->data->avail_inters);
+					atomic_dec(&loopback_devices.pending_inters);
+
+					vl_interrupt(vl_dev, 0);
+				} else {
+					/* Give some time for the current device */
+					wait_event_timeout(
+						vl_dev->wq_notifs_inters,
+						(read_dev_notifs(vl_dev) > 0) ||
+						(read_dev_inters(vl_dev) > 0) ||
+							kthread_should_stop(),
+						msecs_to_jiffies(5));
+				}
+				/* Update currnet time */
+				starting_time = ktime_get();
+			}
+
+			/*
+			 * If the device has not consumed its entire time,
+			 * save the remaining credits for later usage.
+			 */
+			set_dev_credits(vl_dev, ktime_ms_delta(deadline, starting_time));
+			if (read_dev_credits(vl_dev) == 0)
+				reset_credits(vl_dev);
+
+			device = next_elem(device);
+			update_highest_active_prior_notifs();
+
+		} else {
+			wait_event_timeout(
+				loopback_devices.wq_notifs_inters,
+				((available_notifications() || available_interrupts()) &&
+				!list_empty(&loopback_devices.virtio_devices_list)) ||
+				kthread_should_stop(),
+				100 * HZ);
+		}
+	}
+
+sched_exit:
+	pr_info("Clean any remaining devices\n");
+	clean_all_devs();
+
+	pr_info("Exiting notification thread\n");
+	return 0;
+}
+
+/* The notify function used when creating a virtqueue */
+static bool vl_notify(struct virtqueue *vq)
+{
+	struct virtio_loopback_device *vl_dev =
+		to_virtio_loopback_device(vq->vdev);
+	struct notify_data *data;
+
+	pr_debug("VIRTIO_NOTIFY\n");
+
+	/* Create the new node */
+	data = kmalloc(sizeof(struct notify_data), GFP_ATOMIC);
+	if (!data)
+		return false;
+
+	data->index = vq->index;
+	INIT_LIST_HEAD(&data->list);
+
+	/* Add in the notify_list, which should be protected! */
+	spin_lock(&vl_dev->notify_q_lock);
+	list_add_tail(&data->list, &vl_dev->notify_list);
+	spin_unlock(&vl_dev->notify_q_lock);
+
+	pr_debug("Add notification for Device %lu avail credits: %u, avail notifications %u\n",
+			vl_dev->data->vdev_data->init_notif_credits,
+			read_dev_credits(vl_dev),
+			read_dev_notifs(vl_dev));
+
+	/*
+	 * If device has priorities enabled, add the notification into
+	 * the list and leave the notification thread to schedule it
+	 * when this is appropriate.
+	 */
+	if (vl_dev->data->vdev_data->priority_enabled) {
+		pr_debug("WAKEUP notification list\n");
+
+		spin_lock(&vl_dev->notify_q_lock);
+		if (vl_dev->data->priority_group >
+		    atomic_read(&loopback_devices.highest_active_prior_notifs))
+			atomic_set(&loopback_devices.highest_active_prior_notifs,
+				vl_dev->data->priority_group);
+		spin_unlock(&vl_dev->notify_q_lock);
+
+		/* Update atomically the notification counters */
+		atomic_inc(&vl_dev->data->avail_notifs);
+		atomic_inc(&loopback_devices.pending_notifs);
+
+		wake_up(&vl_dev->wq_notifs_inters);
+		wake_up(&loopback_devices.wq_notifs_inters);
+
+		return true;
+	} else {
+		return trigger_notification(vq);
+	}
+}
+
+
+/* the interrupt function used when receiving an IRQ */
+bool register_interrupt(struct virtio_loopback_device *vl_dev, int irq)
+{
+	if (vl_dev->data->vdev_data->priority_enabled) {
+
+		pr_debug("Add notification for Device %lu avail credits: %u, avail inters %u\n",
+				vl_dev->data->vdev_data->init_notif_credits,
+				read_dev_credits(vl_dev),
+				read_dev_inters(vl_dev));
+
+		spin_lock(&vl_dev->notify_q_lock);
+		if (vl_dev->data->priority_group >
+		    atomic_read(&loopback_devices.highest_active_prior_notifs))
+			atomic_set(&loopback_devices.highest_active_prior_notifs,
+				vl_dev->data->priority_group);
+		spin_unlock(&vl_dev->notify_q_lock);
+
+		atomic_inc(&vl_dev->data->avail_inters);
+		atomic_inc(&loopback_devices.pending_inters);
+
+		pr_debug("WAKEUP interrupt list\n");
+		wake_up(&vl_dev->wq_notifs_inters);
+		wake_up(&loopback_devices.wq_notifs_inters);
+
+		return true;
+	} else {
+		return vl_interrupt(vl_dev, irq);
+	}
+}
+
 
 static void vl_del_vq(struct virtqueue *vq)
 {
@@ -745,6 +1223,9 @@ static void virtio_loopback_release_dev(struct device *_d)
 	struct virtio_loopback_device *vl_dev = to_virtio_loopback_device(vdev);
 	struct platform_device *pdev = vl_dev->pdev;
 
+	pr_debug("virtio_loopback_release_dev\n");
+
+	/* Deallocte platform data */
 	devm_kfree(&pdev->dev, vl_dev);
 }
 
@@ -831,13 +1312,16 @@ static int virtio_loopback_probe(struct platform_device *pdev)
 	vl_dev->pdev = pdev;
 	INIT_LIST_HEAD(&vl_dev->virtqueues);
 	spin_lock_init(&vl_dev->lock);
-	/* Initialize the workqueue */
+
+	/* Initialize the notifications related data structures */
 	vl_dev->notify_workqueue =
 		create_singlethread_workqueue("notify_workqueue");
 	INIT_WORK(&vl_dev->notify_work, notify_work_handler);
 	INIT_LIST_HEAD(&vl_dev->notify_list);
 	spin_lock_init(&vl_dev->notify_q_lock);
+	init_waitqueue_head(&vl_dev->wq_notifs_inters);
 
+	/* Set platform data */
 	platform_set_drvdata(pdev, vl_dev);
 
 	/* Insert new entry data */
@@ -848,12 +1332,20 @@ out:
 }
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(6, 10, 8)
-void virtio_loopback_remove(struct platform_device *pdev)
+static void virtio_loopback_remove(struct platform_device *pdev)
 #else
-int virtio_loopback_remove(struct platform_device *pdev)
+static int virtio_loopback_remove(struct platform_device *pdev)
 #endif
 {
-	struct virtio_loopback_device *vl_dev = platform_get_drvdata(pdev);
+	struct virtio_loopback_device *vl_dev;
+
+	pr_debug("virtio_loopback_remove\n");
+	vl_dev = platform_get_drvdata(pdev);
+
+	if (vl_dev->data == NULL) {
+		pr_debug("Dev already deallocated\n");
+		return 0;
+	}
 
 	/* Destroy the notify workqueue */
 	flush_workqueue(vl_dev->notify_workqueue);
@@ -862,9 +1354,15 @@ int virtio_loopback_remove(struct platform_device *pdev)
 	if (vl_dev->data) {
 		unregister_virtio_device(&vl_dev->vdev);
 		pr_info("unregister_virtio_device!\n");
-		/* Proceed to de-activating the data for this entry */
-		vl_dev->data = NULL;
 	}
+
+	/* Subsequently free the device data */
+	free_page((unsigned long)vl_dev->data->info->data);
+	kfree(vl_dev->data->info);
+	eventfd_ctx_put(vl_dev->data->efd_ctx);
+	vl_dev->data->efd_ctx = NULL;
+	kfree(vl_dev->data);
+	vl_dev->data = NULL;
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(6, 10, 8)
 	return 0;
@@ -920,7 +1418,7 @@ static uint64_t read_adapter(uint64_t fn_id, uint64_t size,
 	       atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
 		wait_event_timeout(dev_data->wq,
 			atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1,
-			1 * HZ);
+			100 * HZ);
 
 	result = ((struct virtio_neg *)(dev_data->info->data))->data;
 
@@ -967,7 +1465,7 @@ static void write_adapter(uint64_t data, uint64_t fn_id, uint64_t size,
 	       atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) != 1)
 		wait_event_timeout(dev_data->wq,
 			atomic_read(&((struct virtio_neg *)(dev_data->info->data))->done) == 1,
-			1 * HZ);
+			100 * HZ);
 
 	mutex_unlock(&(dev_data)->read_write_lock);
 }

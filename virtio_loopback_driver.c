@@ -37,8 +37,8 @@
 MODULE_LICENSE("GPL");
 
 /* The global data for the loopback */
-static struct loopback_device_data loopback_data;
-static struct loopback_devices_array loopback_devices;
+struct loopback_device_data loopback_data;
+struct loopback_devices_array loopback_devices;
 
 /*
  * This function registers all mmap calls done by the user-space into an array
@@ -414,7 +414,8 @@ int insert_entry_data(struct virtio_loopback_device *vl_dev, int id)
 
 /* Helper function to mark an entry as active */
 static struct virtio_loopback_device *
-activate_entry_data(struct device_data *data, uint32_t curr_dev_id)
+activate_entry_data(struct file_priv_data *file_data,
+		    uint32_t curr_dev_id)
 {
 	struct virtio_loopback_device *vl_dev = NULL;
 
@@ -422,7 +423,26 @@ activate_entry_data(struct device_data *data, uint32_t curr_dev_id)
 	if (curr_dev_id < MAX_PDEV) {
 		/* Find and store the data */
 		vl_dev = loopback_devices.devices[curr_dev_id];
-		vl_dev->data = data;
+		vl_dev->data = file_data->dev_data;
+		vl_dev->data->vdev_data = &file_data->device_info;
+
+		/* Add this device to a global list */
+		if (!add_dev_to_list(curr_dev_id))
+			return NULL;
+
+		/* Set credits & last served timestamp */
+		atomic_set(&vl_dev->data->notif_credits,
+			vl_dev->data->vdev_data->init_notif_credits);
+		vl_dev->data->served_timestamp = ktime_get();
+
+		/* Set available notifs */
+		atomic_set(&vl_dev->data->avail_notifs, 0);
+
+		/* Set device group */
+		vl_dev->data->priority_group = vl_dev->data->vdev_data->priority_group;
+
+		/* Set available interupts */
+		atomic_set(&vl_dev->data->avail_inters, 0);
 	}
 
 	return vl_dev;
@@ -435,7 +455,7 @@ static int start_loopback(struct file_priv_data *file_data,
 	int ret;
 
 	/* Activate the entry */
-	vl_dev = activate_entry_data(file_data->dev_data, curr_dev_id);
+	vl_dev = activate_entry_data(file_data, curr_dev_id);
 	if (vl_dev) {
 		file_data->vl_dev_irq = vl_dev;
 		/* Register the activated vl_dev in the system */
@@ -547,6 +567,7 @@ static long loopback_ioctl(struct file *file, unsigned int cmd,
 				   sizeof(struct virtio_device_info_struct)))
 			return -EFAULT;
 
+		pr_crit("Priority: %lu\n", file_data->device_info.init_notif_credits);
 		/* Read and increase that value atomically */
 		curr_avail_dev_id =
 			atomic_add_return(1, &loopback_devices.device_num) - 1;
@@ -573,13 +594,7 @@ static long loopback_ioctl(struct file *file, unsigned int cmd,
 	case IRQ:
 		if (copy_from_user(&irq, (int *) arg, sizeof(int)))
 			return -EFAULT;
-		/*
-		 * Both of the interrupt ways work but a) is more stable
-		 * and b) has better performance:
-		 * a) vl_interrupt(NULL);
-		 * b) queue_work(interrupt_workqueue, &async_interrupt);
-		 */
-		vl_interrupt(file_data->vl_dev_irq, irq);
+		register_interrupt(file_data->vl_dev_irq, irq);
 		break;
 	case SHARE_VQS:
 		if (copy_from_user(&queue_sel, (uint32_t *) arg,
@@ -687,6 +702,19 @@ error_kmalloc:
 	return -ENOMEM;
 }
 
+static int start_notif_thread(void)
+{
+	loopback_data.notif_thread = kthread_run(notif_sched_func, NULL,
+						    "notif_thread");
+	if (IS_ERR(loopback_data.notif_thread)) {
+		pr_err("Failed to create kernel thread\n");
+		return PTR_ERR(loopback_data.notif_thread);
+	}
+
+	pr_info("Kernel notif thread started successfully\n");
+	return 0;
+}
+
 static int loopback_release(struct inode *inode, struct file *file)
 {
 	struct file_priv_data *file_data =
@@ -696,31 +724,35 @@ static int loopback_release(struct inode *inode, struct file *file)
 	struct mmap_data *mm_data = (struct mmap_data *)file_data->mm_data;
 
 	pr_info("Releasing the device\n");
+
+	/* Unregister from the list */
+	note_dev_deletion(file_data->vl_dev_irq);
+
 	/*
 	 * This makes the read/write do not wait
 	 * for the virtio-loopback-adapter if
 	 * the last has closed the fd
 	 */
 	dev_data->valid_eventfd = false;
+
 	/* Active entry found */
 	if (file_data->vl_dev_irq) {
 		pr_debug("About to cancel the work\n");
+		/* TODO: Move this into virtio_loopback_remove */
 		/* Cancel any pending work */
 		cancel_work_sync(&file_data->vl_dev_irq->notify_work);
 		/* Continue with the vl_dev unregister */
-		virtio_loopback_driver.remove(file_data->vl_dev_irq->pdev);
+		platform_device_unregister(file_data->vl_dev_irq->pdev);
 		file_data->vl_dev_irq = NULL;
 	}
-	/* Subsequently free the dev_data */
-	free_page((unsigned long)dev_data->info->data);
-	kfree(dev_data->info);
-	eventfd_ctx_put(dev_data->efd_ctx);
-	dev_data->efd_ctx = NULL;
-	kfree(dev_data);
-	file_data->dev_data = NULL;
+
+	/* Proceed to de-activating the data for this entry */
+	dev_data = NULL;
+
 	/* Continue with the mm_data */
 	kfree(mm_data);
 	file_data->mm_data = NULL;
+
 	/* Last, free the private data */
 	kfree(file_data);
 	file->private_data = NULL;
@@ -773,22 +805,42 @@ static int __init loopback_init(void)
 	for (i = 0; i < MAX_PDEV; i++)
 		init_completion(&loopback_devices.reg_vl_dev_completion[i]);
 
-	return 0;
+	/* Init loopback device list */
+	INIT_LIST_HEAD(&loopback_devices.virtio_devices_list);
+
+	/* Init notification / interrupt wait queue */
+	init_waitqueue_head(&loopback_devices.wq_notifs_inters);
+
+	/* Init spinlock for when device is running */
+	spin_lock_init(&loopback_devices.running_lock);
+
+	/* Init pending notifications counter */
+	atomic_set(&loopback_devices.pending_notifs, 0);
+
+	/* Init pending interrupts counter */
+	atomic_set(&loopback_devices.pending_inters, 0);
+
+	/* Init current highest notifications priority */
+	atomic_set(&loopback_devices.highest_active_prior_notifs, 0);
+
+	/* Start nofication thread */
+	return start_notif_thread();
 }
 
 static void __exit loopback_exit(void)
 {
-	int i;
-	uint32_t max_used_device_num =
-		atomic_read(&loopback_devices.device_num);
+	int ret;
 
 	pr_info("Exit virtio_loopback driver!\n");
 
-	/* Unregister loopback devices */
-	for (i = 0; i < max_used_device_num; i++)
-		if (loopback_devices.devices[i])
-			platform_device_unregister(
-				loopback_devices.devices[i]->pdev);
+	/* Wait for notification / interrupt thread to stop */
+	if (loopback_data.notif_thread) {
+		ret = kthread_stop(loopback_data.notif_thread);
+		if (ret) {
+			pr_err("Kernel notif thread returned error: %d\n"
+			       , ret);
+		}
+	}
 
 	/* Unregister virtio_loopback_transport */
 	platform_driver_unregister(&virtio_loopback_driver);

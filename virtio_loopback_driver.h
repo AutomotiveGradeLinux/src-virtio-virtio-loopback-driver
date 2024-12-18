@@ -103,6 +103,9 @@ struct virtio_device_info_struct {
 	unsigned long version;
 	unsigned long device_id;
 	unsigned long vendor;
+	bool priority_enabled;
+	unsigned long init_notif_credits;
+	unsigned long priority_group;
 };
 
 struct virtio_neg {
@@ -162,16 +165,35 @@ struct device_data {
 	bool valid_eventfd;
 	/* vq data */
 	struct vq_data vq_data;
+
+	/* virtio device data */
+	struct virtio_device_info_struct *vdev_data;
+	bool priority_enabled;
+	uint32_t priority_group;
+	atomic_t notif_credits;
+	atomic_t avail_notifs;
+	atomic_t avail_inters;
+	uint64_t served_timestamp;
 };
 
 /* Data describing each entry of the driver */
 struct loopback_devices_array {
 	/* Array of probed devices */
 	struct virtio_loopback_device *devices[MAX_PDEV];
+	/* list of the devices */
+	struct list_head virtio_devices_list;
 	/* Number of available devices */
 	atomic_t device_num;
 	/* Registration completion */
 	struct completion reg_vl_dev_completion[MAX_PDEV];
+	/* Counter for all devices pending notifications */
+	atomic_t highest_active_prior_notifs;
+	atomic_t pending_notifs;
+	atomic_t pending_inters;
+	wait_queue_head_t wq_notifs_inters;
+
+	/* Spin lock for removing the device */
+	spinlock_t running_lock;
 };
 
 /* Data concealed in the file private pointer */
@@ -209,6 +231,9 @@ struct virtio_loopback_device {
 	spinlock_t notify_q_lock;
 	struct list_head notify_list;
 	struct work_struct notify_work;
+
+	/* Notification waitqueue */
+	wait_queue_head_t wq_notifs_inters;
 };
 
 struct virtio_loopback_vq_info {
@@ -218,8 +243,23 @@ struct virtio_loopback_vq_info {
 	struct list_head node;
 };
 
+struct virtio_loopback_device_node {
+	/* the actual virtqueue */
+	uint32_t vq_index;
+	atomic_t is_deleted;
+	/* the list node for the virtqueues list */
+	struct list_head node;
+	struct rcu_head rcu;
+};
+
 /* Notify data*/
 struct notify_data {
+	uint32_t index;
+	struct list_head list;
+};
+
+/* Interrupt data*/
+struct interrupt_data {
 	uint32_t index;
 	struct list_head list;
 };
@@ -246,6 +286,7 @@ struct loopback_device_data {
 	/* sysfs class structure */
 	struct class *class;
 	struct cdev cdev;
+	struct task_struct *notif_thread;
 };
 
 /* Global variables */
@@ -254,6 +295,11 @@ extern struct platform_driver virtio_loopback_driver;
 /* Global functions */
 int insert_entry_data(struct virtio_loopback_device *vl_dev, int id);
 int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev);
-bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq);
+bool register_interrupt(struct virtio_loopback_device *vl_dev, int irq);
+int notif_sched_func(void *data);
+bool add_dev_to_list(uint32_t array_dev_pos);
+void note_dev_deletion(struct virtio_loopback_device *vl_dev);
+extern struct loopback_devices_array loopback_devices;
+extern struct loopback_device_data loopback_data;
 
 #endif /* __LOOPBACK_H__ */
