@@ -18,3 +18,8 @@ The driver has been tested with the following platforms (sorted by architecture)
 - x86: QEMU (machine `pc`), Thinkpad e14 gen3, x86 servers etc.
 - aarch64: QEMU (machine `virt`), Raspberry PI 4, AGL reference HW board (Rcar-H3)
 - riscv64: LicheePi4A
+
+## License
+
+This project is licensed under the terms of the GNU General Public License (GPL), version 2 or (at your option) any later version. See the [COPYING](COPYING) file for details.
+
