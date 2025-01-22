@@ -40,178 +40,6 @@ MODULE_LICENSE("GPL");
 struct loopback_device_data loopback_data;
 struct loopback_devices_array loopback_devices;
 
-/*
- * This function registers all mmap calls done by the user-space into an array
- */
-static void add_share_mmap(struct file *filp, uint64_t pfn,
-			   uint64_t vm_start, uint64_t size)
-{
-	struct file_priv_data *file_data =
-		(struct file_priv_data *)(filp->private_data);
-	struct mmap_data *mm_data = (struct mmap_data *)file_data->mm_data;
-
-	mm_data->share_mmap_list[mm_data->mmap_index].pfn = pfn;
-	mm_data->share_mmap_list[mm_data->mmap_index].vm_start = vm_start;
-	mm_data->share_mmap_list[mm_data->mmap_index].size = size;
-	mm_data->share_mmap_list[mm_data->mmap_index].uid =
-		task_pid_nr(current);
-	mm_data->mmap_index++;
-}
-
-/*
- * This function removes a record from mmap array
- */
-static void share_mmap_rem(struct vm_area_struct *vma)
-{
-	struct file *file = vma->vm_file;
-	struct file_priv_data *file_data =
-		(struct file_priv_data *)(file->private_data);
-	struct mmap_data *mm_data = (struct mmap_data *)file_data->mm_data;
-	int i;
-
-	for (i = 0; i < MMAP_LIMIT; i++) {
-		if (mm_data->share_mmap_list[i].vm_start == vma->vm_start) {
-			mm_data->share_mmap_list[i].uid = 0;
-			mm_data->share_mmap_list[i].pfn = 0;
-			mm_data->share_mmap_list[i].vm_start = 0;
-			mm_data->share_mmap_list[i].size = 0;
-		}
-	}
-}
-
-static void print_mmap_idx(struct mmap_data *mm_data, int i)
-{
-	pr_debug("share_mmap_list[%d].uid %x\n", i,
-		 mm_data->share_mmap_list[i].uid);
-	pr_debug("share_mmap_list[%d].pfn %llx\n", i,
-		 mm_data->share_mmap_list[i].pfn);
-	pr_debug("share_mmap_list[%d].vm_start %llx\n", i,
-		 mm_data->share_mmap_list[i].vm_start);
-	pr_debug("share_mmap_list[%d].size %x\n", i,
-		 mm_data->share_mmap_list[i].size);
-}
-
-/**
- * print_mmaps - Debug function to print details of all active mmap entries
- * @mm_data: Pointer to the mmap_data structure containing mmap details
- *
- * This function iterates through the `share_mmap_list` array in the given
- * `mm_data` structure and logs the details of each active mmap entry by
- * calling `print_mmap_idx`. The number of entries printed is determined as:
- * - `MMAP_LIMIT` if `mmap_index` is `0`.
- * - The value of `mmap_index` otherwise.
- *
- * Note:
- * - The function uses `pr_debug` for logging, so enable debugging to see
- *   the output.
- * - Ensure that `mm_data` is properly initialized before calling this
- *   function to avoid accessing invalid memory.
- */
-
-static void print_mmaps(struct mmap_data *mm_data)
-{
-	int i, limit =
-		mm_data->mmap_index == 0 ? MMAP_LIMIT : mm_data->mmap_index;
-
-	for (i = 0; i < limit; i++)
-		print_mmap_idx(mm_data, i);
-}
-
-/**
- * share_mmap_exist_vma_return_correct_pfn - Calculate corrected PFN for a
- * given address.
- * @mm_data: Pointer to struct containing memory mapping data
- * @addr: Address for which to calculate the corrected PFN
- *
- * This function iterates through the list of shared memory mappings in
- * `mm_data` and checks if the given `addr` lies within any of the mappings.
- * If it does, it computes the corrected PFN based on the mapping's start
- * address, size, and PFN.
- *
- * Returns:
- * - The corrected PFN if the address falls within a mapping.
- * - 0 if the address does not match any mapping.
- */
-static uint64_t share_mmap_exist_vma_return_correct_pfn(
-					struct mmap_data *mm_data,
-					uint64_t addr)
-{
-	int i;
-	uint64_t corrected_pfn;
-
-	for (i = 0; i < MMAP_LIMIT; i++) {
-		if ((mm_data->share_mmap_list[i].vm_start <= addr) &&
-		    (addr < mm_data->share_mmap_list[i].vm_start +
-		    mm_data->share_mmap_list[i].size)) {
-			corrected_pfn = ((addr -
-					  mm_data->share_mmap_list[i].vm_start)
-					 / PAGE_SIZE)
-					+ mm_data->share_mmap_list[i].pfn;
-			return corrected_pfn;
-		}
-	}
-	return 0;
-}
-
-/**
- * pf_mmap_fault - Handle page faults for the device mmap area
- * @vmf: Pointer to the `vm_fault` structure containing fault information
- *
- * This function is called during a page fault to find and insert the correct
- * page for the faulting address. It calculates the corrected PFN using the
- * provided mmap data of the device and updates the faulting page.
- *
- * Returns:
- * - 0 if successful.
- * - `VM_FAULT_SIGBUS` on failure.
- */
-static vm_fault_t pf_mmap_fault(struct vm_fault *vmf)
-{
-	uint64_t corrected_pfn;
-	pfn_t corr_pfn_struct;
-	struct page *page;
-
-	struct file *file = vmf->vma->vm_file;
-	struct file_priv_data *file_data =
-		(struct file_priv_data *)(file->private_data);
-	struct mmap_data *mm_data =
-		(struct mmap_data *)file_data->mm_data;
-
-	/* Count the total number of page_faults for debugging purpose */
-	mm_data->sum_pgfaults++;
-
-	/* Find the corrected pfn */
-	corrected_pfn = share_mmap_exist_vma_return_correct_pfn(mm_data,
-								vmf->address);
-	corr_pfn_struct.val = corrected_pfn;
-
-	/* Ensure the PFN is valid */
-	if (unlikely(!pfn_valid(corrected_pfn))) {
-		pr_err("Invalid PFN: %llu\n", corrected_pfn);
-		return VM_FAULT_SIGBUS;
-	}
-
-	/* After finding the page, correct the vmf->page */
-	page = pfn_to_page(corrected_pfn);
-	if (unlikely(!virt_addr_valid(page_address(page)))) {
-		pr_err("Invalid page address for PFN: %llu\n", corrected_pfn);
-		return VM_FAULT_SIGBUS;
-	}
-
-	/* Insert the correct page */
-	return vmf_insert_pfn(vmf->vma, vmf->address, corrected_pfn);
-}
-
-static void pf_mmap_close(struct vm_area_struct *vma)
-{
-	share_mmap_rem(vma);
-}
-
-const struct vm_operations_struct pf_mmap_ops = {
-	.close = pf_mmap_close,
-	.fault = pf_mmap_fault,
-};
-
 /**
  * pf_mmap_vm_page - Set up memory mapping for a file
  * @filp: Pointer to the file structure for the mapping
@@ -227,18 +55,7 @@ const struct vm_operations_struct pf_mmap_ops = {
  */
 static int pf_mmap_vm_page(struct file *filp, struct vm_area_struct *vma)
 {
-	uint64_t size = (unsigned long)(vma->vm_end - vma->vm_start);
-	struct file_priv_data *file_data =
-		(struct file_priv_data *)(filp->private_data);
-	struct mmap_data *mm_data = (struct mmap_data *)file_data->mm_data;
-	uint64_t pfn = ((mm_data->cur_ram_idx++) * (size >> PAGE_SHIFT));
-
-#if LINUX_VERSION_CODE <  KERNEL_VERSION(6, 3, 0)
-		vma->vm_flags |= VM_PFNMAP;
-#else
-		vm_flags_set(vma, VM_PFNMAP);
-#endif
-	add_share_mmap(filp, pfn, vma->vm_start, size);
+	(void)vl_domain_mmap(filp, vma);
 	return 0;
 }
 
@@ -285,12 +102,8 @@ static int mmap_vqs_com_struct(struct file *filp, struct vm_area_struct *vma)
 
 	ret = remap_pfn_range(vma, vma->vm_start, starting_pfn, size,
 			      vma->vm_page_prot);
-	if (ret != 0) {
+	if (ret != 0)
 		pr_err("Mmap error\n");
-		print_mmaps(mmap_data);
-	} else {
-		add_share_mmap(filp, starting_pfn, vma->vm_start, size);
-	}
 
 	return ret;
 }
@@ -318,12 +131,11 @@ static int op_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct mmap_data *mmap_data = (struct mmap_data *)file_data->mm_data;
 	int ret = 0;
 
-	vma->vm_ops = &pf_mmap_ops;
-
-	if (mmap_data->share_communication_struct || mmap_data->share_vqs)
+	if (mmap_data->share_communication_struct || mmap_data->share_vqs) {
 		ret = mmap_vqs_com_struct(filp, vma);
-	else
+	} else {
 		ret = pf_mmap_vm_page(filp, vma);
+	}
 
 	return ret;
 }
@@ -683,11 +495,8 @@ static int loopback_open(struct inode *inode, struct file *file)
 	file_data->dev_data = dev_data;
 
 	/* Init file mmap_data */
-	mm_data->mmap_index = 0;
 	mm_data->share_communication_struct = false;
 	mm_data->share_vqs = false;
-	mm_data->cur_ram_idx = 0;
-	mm_data->sum_pgfaults = 0;
 	file_data->mm_data = mm_data;
 
 	/* Store in the private data as it should */
@@ -824,7 +633,10 @@ static int __init loopback_init(void)
 	atomic_set(&loopback_devices.highest_active_prior_notifs, 0);
 
 	/* Start nofication thread */
-	return start_notif_thread();
+	(void)start_notif_thread();
+
+	/* Prepare IOMMU */
+	return vl_domain_init();
 }
 
 static void __exit loopback_exit(void)
@@ -845,6 +657,9 @@ static void __exit loopback_exit(void)
 	/* Unregister virtio_loopback_transport */
 	platform_driver_unregister(&virtio_loopback_driver);
 	pr_debug("platform_driver_unregister!\n");
+
+	/* Remove iommu */
+	vl_domain_exit();
 
 	/* Necessary actions for the loopback_data */
 	device_destroy(loopback_data.class, MKDEV(loopback_data.dev_major, 0));

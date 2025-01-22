@@ -171,6 +171,9 @@ static u64 vl_get_features(struct virtio_device *vdev)
 	write_adapter(0, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 4, data);
 	features |= read_adapter(VIRTIO_MMIO_DEVICE_FEATURES, 4, data);
 
+	/* Add VIRTIO_F_ACCESS_PLATFORM */
+	features |= (u64)(1) << VIRTIO_F_ACCESS_PLATFORM;
+
 	return features;
 }
 
@@ -686,6 +689,7 @@ static bool vl_interrupt(struct virtio_loopback_device *vl_dev, int irq)
 {
 	struct virtio_loopback_vq_info *info;
 
+	pr_debug("vl_interrupt\n");
 	spin_lock(&vl_dev->lock);
 	list_for_each_entry(info, &vl_dev->virtqueues, node) {
 		(void)vring_interrupt(irq, info->vq);
@@ -921,6 +925,7 @@ static bool vl_notify(struct virtqueue *vq)
 /* the interrupt function used when receiving an IRQ */
 bool register_interrupt(struct virtio_loopback_device *vl_dev, int irq)
 {
+	pr_debug("Received an interrupt\n");
 	if (vl_dev->data->vdev_data->priority_enabled) {
 
 		pr_debug("Add notification for Device %lu avail credits: %u, avail inters %u\n",
@@ -1229,6 +1234,105 @@ static void virtio_loopback_release_dev(struct device *_d)
 	devm_kfree(&pdev->dev, vl_dev);
 }
 
+static inline struct virtio_loopback_device *dev_to_vl(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+
+	return (struct virtio_loopback_device *)platform_get_drvdata(pdev);
+}
+
+static void vl_dev_sync_single_for_device(struct device *dev,
+					     dma_addr_t dma_addr, size_t size,
+					     enum dma_data_direction dir)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	pr_debug("vl_dev_sync_single_for_device\n");
+	vl_domain_sync_single_for_device(domain, dma_addr, size, dir);
+
+}
+
+static void vl_dev_sync_single_for_cpu(struct device *dev,
+					     dma_addr_t dma_addr, size_t size,
+					     enum dma_data_direction dir)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	pr_debug("vl_dev_sync_single_for_cpu\n");
+	vl_domain_sync_single_for_cpu(domain, dma_addr, size, dir);
+}
+
+static dma_addr_t vl_dev_map_page(struct device *dev, struct page *page,
+				     unsigned long offset, size_t size,
+				     enum dma_data_direction dir,
+				     unsigned long attrs)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	return vl_domain_map_page(domain, page, offset, size, dir, attrs);
+}
+
+static void vl_dev_unmap_page(struct device *dev, dma_addr_t dma_addr,
+				size_t size, enum dma_data_direction dir,
+				unsigned long attrs)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	return vl_domain_unmap_page(domain, dma_addr, size, dir, attrs);
+}
+
+static void *vl_dev_alloc_coherent(struct device *dev, size_t size,
+					dma_addr_t *dma_addr, gfp_t flag,
+					unsigned long attrs)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+	unsigned long iova;
+	void *addr;
+
+	*dma_addr = DMA_MAPPING_ERROR;
+	addr = vl_domain_alloc_coherent(domain, size,
+				(dma_addr_t *)&iova, flag, attrs);
+	if (!addr)
+		return NULL;
+
+	*dma_addr = (dma_addr_t)iova;
+
+	return addr;
+}
+
+static void vl_dev_free_coherent(struct device *dev, size_t size,
+					void *vaddr, dma_addr_t dma_addr,
+					unsigned long attrs)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	vl_domain_free_coherent(domain, size, vaddr, dma_addr, attrs);
+}
+
+static size_t vl_dev_max_mapping_size(struct device *dev)
+{
+	struct virtio_loopback_device *vl_dev = dev_to_vl(dev);
+	struct vl_iova_domain *domain = vl_dev->domain;
+
+	return domain->bounce_size;
+}
+
+static const struct dma_map_ops vl_dev_dma_ops = {
+	.sync_single_for_device = vl_dev_sync_single_for_device,
+	.sync_single_for_cpu = vl_dev_sync_single_for_cpu,
+	.map_page = vl_dev_map_page,
+	.unmap_page = vl_dev_unmap_page,
+	.alloc = vl_dev_alloc_coherent,
+	.free = vl_dev_free_coherent,
+	.max_mapping_size = vl_dev_max_mapping_size,
+};
+
 /* Function to carry-out the registration of the virtio_loopback */
 int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev)
 {
@@ -1266,6 +1370,8 @@ int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev)
 
 	vl_dev->vdev.id.vendor = read_adapter(VIRTIO_MMIO_VENDOR_ID, 4, data);
 
+	vl_dev->bounce_size = VDUSE_BOUNCE_SIZE;
+
 	if (vl_dev->version == 1) {
 		write_adapter(PAGE_SIZE, VIRTIO_MMIO_GUEST_PAGE_SIZE, 4, data);
 
@@ -1285,6 +1391,19 @@ int loopback_register_virtio_dev(struct virtio_loopback_device *vl_dev)
 	if (rc)
 		dev_warn(&pdev->dev,
 			 "Failed to enable 64-bit or 32-bit DMA. Trying to continue, but this might not work.\n");
+
+	/* Override DMA ops */
+	set_dma_ops(&pdev->dev, &vl_dev_dma_ops);
+
+	mutex_lock(&vl_dev->domain_lock);
+	if (!vl_dev->domain)
+		vl_dev->domain = vl_domain_create(VDUSE_IOVA_SIZE - 1,
+						  vl_dev->bounce_size);
+	mutex_unlock(&vl_dev->domain_lock);
+	if (!vl_dev->domain) {
+		put_device(&pdev->dev);
+		return -ENOMEM;
+	}
 
 	/* Register the virtio device in the system */
 	rc = register_virtio_device(&vl_dev->vdev);
@@ -1319,6 +1438,7 @@ static int virtio_loopback_probe(struct platform_device *pdev)
 	INIT_WORK(&vl_dev->notify_work, notify_work_handler);
 	INIT_LIST_HEAD(&vl_dev->notify_list);
 	spin_lock_init(&vl_dev->notify_q_lock);
+	mutex_init(&vl_dev->domain_lock);
 	init_waitqueue_head(&vl_dev->wq_notifs_inters);
 
 	/* Set platform data */

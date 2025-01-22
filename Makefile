@@ -17,7 +17,7 @@
 
 LINUX_DIR ?= /lib/modules/$(shell uname -r)/build
 
-virtio_loopback-objs := virtio_loopback_driver.o virtio_loopback_device.o
+virtio_loopback-objs := virtio_loopback_driver.o virtio_loopback_device.o iova_domain.o
 obj-m += virtio_loopback.o
 
 ifeq ($(DEBUG), 1)

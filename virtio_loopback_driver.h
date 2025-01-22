@@ -39,6 +39,16 @@
 #include <linux/smp.h>
 #include <linux/version.h>
 #include <linux/completion.h>
+#include <linux/dma-map-ops.h>
+#include <linux/swiotlb.h>
+#include <linux/dma-direct.h>
+
+/* vDUSE includes */
+#include <linux/iova.h>
+#include <linux/dma-mapping.h>
+#include <linux/vhost_iotlb.h>
+#include <linux/mm.h>
+#include <linux/mmu_context.h>
 
 /* MMIO includes */
 #include <linux/acpi.h>
@@ -70,9 +80,6 @@
 #define MAX_DEV	1
 #define MAX_PDEV 100
 #define PDEV_TYPES 2
-
-/* Define mmap elements limit */
-#define MMAP_LIMIT	200
 
 /*
  * The alignment to use between consumer and producer parts of vring.
@@ -116,21 +123,9 @@ struct virtio_neg {
 	atomic_t done;
 };
 
-struct share_mmap {
-	uint64_t pfn;
-	uint64_t vm_start;
-	uint32_t size;
-	uint32_t uid;
-	struct page *page;
-};
-
 struct mmap_data {
-	int mmap_index;
 	bool share_communication_struct;
 	bool share_vqs;
-	struct share_mmap share_mmap_list[MMAP_LIMIT];
-	int cur_ram_idx;
-	uint64_t sum_pgfaults;
 };
 
 struct vq_notifier {
@@ -208,11 +203,38 @@ struct file_priv_data {
 	struct virtio_loopback_device *vl_dev_irq;
 };
 
+struct vl_bounce_map {
+	struct page *bounce_page;
+	enum dma_data_direction dir;
+	struct page *user_bounce_page;
+	u64 orig_phys;
+	u64 addr;
+};
+
+struct vl_iova_domain {
+	struct iova_domain stream_iovad;
+	struct iova_domain zc_iovad;
+	struct iova_domain consistent_iovad;
+	struct vl_bounce_map *bounce_maps;
+	size_t bounce_size;
+	unsigned long iova_limit;
+	int bounce_map;
+	struct vhost_iotlb *iotlb;
+	spinlock_t iotlb_lock;
+	struct file *file;
+	bool user_bounce_pages;
+	rwlock_t bounce_lock;
+	struct vm_area_struct *vma;
+};
+
 struct virtio_loopback_device {
 	struct virtio_device vdev;
 	struct platform_device *pdev;
 	/* Corresponding data pointer */
 	struct device_data *data;
+
+	/* SWIOTLB */
+	struct vl_iova_domain *domain;
 
 	/* Status: -1 not initialized, 0 running, 1 paused */
 	int status;
@@ -234,6 +256,10 @@ struct virtio_loopback_device {
 
 	/* Notification waitqueue */
 	wait_queue_head_t wq_notifs_inters;
+
+	/* vduse attrs */
+	unsigned int bounce_size;
+	struct mutex domain_lock;
 };
 
 struct virtio_loopback_vq_info {
@@ -302,4 +328,42 @@ void note_dev_deletion(struct virtio_loopback_device *vl_dev);
 extern struct loopback_devices_array loopback_devices;
 extern struct loopback_device_data loopback_data;
 
+/* vduse includes */
+#define IOVA_START_PFN 1
+#define INVALID_PHYS_ADDR (~(phys_addr_t)0)
+#define VDUSE_MAX_BOUNCE_SIZE (1024 * 1024 * 1024)
+#define VDUSE_MIN_BOUNCE_SIZE (1024 * 1024)
+#define VDUSE_BOUNCE_SIZE (128 * 1024 * 1024)
+/* 128 MB reserved for virtqueue creation */
+#define VDUSE_IOVA_SIZE (VDUSE_MAX_BOUNCE_SIZE + 128 * 1024 * 1024)
+
+void vl_domain_sync_single_for_device(struct vl_iova_domain *domain,
+                                      dma_addr_t dma_addr, size_t size,
+                                      enum dma_data_direction dir);
+void vl_domain_sync_single_for_cpu(struct vl_iova_domain *domain,
+                                      dma_addr_t dma_addr, size_t size,
+                                      enum dma_data_direction dir);
+dma_addr_t vl_domain_map_page(struct vl_iova_domain *domain,
+                                 struct page *page, unsigned long offset,
+                                 size_t size, enum dma_data_direction dir,
+                                 unsigned long attrs);
+void vl_domain_unmap_page(struct vl_iova_domain *domain,
+                             dma_addr_t dma_addr, size_t size,
+                             enum dma_data_direction dir, unsigned long attrs);
+void *vl_domain_alloc_coherent(struct vl_iova_domain *domain,
+                                  size_t size, dma_addr_t *dma_addr,
+                                  gfp_t flag, unsigned long attrs);
+void vl_domain_free_coherent(struct vl_iova_domain *domain, size_t size,
+                                void *vaddr, dma_addr_t dma_addr,
+                                unsigned long attrs);
+void vl_domain_reset_bounce_map(struct vl_iova_domain *domain);
+struct vl_iova_domain *vl_domain_create(unsigned long iova_limit,
+                                              size_t bounce_size);
+int vl_domain_init(void);
+void vl_domain_exit(void);
+int vl_domain_mmap(struct file *file, struct vm_area_struct *vma);
+int vl_iotlb_add_range(struct vl_iova_domain *domain,
+				 u64 start, u64 last,
+				 u64 addr, unsigned int perm,
+				 struct file *file, u64 offset);
 #endif /* __LOOPBACK_H__ */
