@@ -1344,7 +1344,11 @@ static int virtio_loopback_remove(struct platform_device *pdev)
 
 	if (vl_dev->data == NULL) {
 		pr_debug("Dev already deallocated\n");
+#if LINUX_VERSION_CODE > KERNEL_VERSION(6, 10, 8)
+		return;
+#else
 		return 0;
+#endif
 	}
 
 	/* Destroy the notify workqueue */

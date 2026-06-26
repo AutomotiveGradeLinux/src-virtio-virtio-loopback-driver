@@ -168,7 +168,6 @@ static uint64_t share_mmap_exist_vma_return_correct_pfn(
 static vm_fault_t pf_mmap_fault(struct vm_fault *vmf)
 {
 	uint64_t corrected_pfn;
-	pfn_t corr_pfn_struct;
 	struct page *page;
 
 	struct file *file = vmf->vma->vm_file;
@@ -183,7 +182,6 @@ static vm_fault_t pf_mmap_fault(struct vm_fault *vmf)
 	/* Find the corrected pfn */
 	corrected_pfn = share_mmap_exist_vma_return_correct_pfn(mm_data,
 								vmf->address);
-	corr_pfn_struct.val = corrected_pfn;
 
 	/* Ensure the PFN is valid */
 	if (unlikely(!pfn_valid(corrected_pfn))) {
